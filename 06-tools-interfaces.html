@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · 工具与运行接口 — pi 源码之旅</title>
+<meta name="description" content="pi 内置工具的设计、工具结果契约、文件变更队列、截断策略，以及 interactive/print/JSON/RPC/SDK 五种运行接口。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">工具与运行接口</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 06 · tools &amp; surfaces</div>
+            <h1>工具是函数，<br>也是一份给模型的合同</h1>
+            <p class="lead">在 pi 里，工具不是“能力插件”，而是三样东西的组合：给模型看的 schema 与说明、给运行时执行的函数、给 UI 的渲染器。这一章从 <code>AgentTool</code> 契约读到内置工具的实现细节，再看同一内核如何暴露成五种运行接口。</p>
+            <div class="meta-row">
+              <span>阅读约 30 分钟</span>
+              <span>关键文件 6 个</span>
+              <span>工具链 + 接口矩阵</span>
+            </div>
+          </header>
+
+          <h2 id="contract"><span class="h2-num">6.1</span>AgentTool：最小执行契约</h2>
+          <p><code>AgentTool</code> 只比“带 schema 的函数”多几个可选字段。它刻意保持小，因为这是扩展作者与内核之间的稳定边界。</p>
+
+          <div class="code-panel" data-file="packages/agent/src/types.ts" data-lang="ts" data-start="466" data-highlight="3-8,13-22,24-28,30-33">
+            <div class="code-head">
+              <span class="path">packages/agent/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any> extends Tool<TParameters> {
+	/** Human-readable label for UI display. */
+	label: string;
+	/**
+	 * Optional compatibility shim for raw tool-call arguments before schema validation.
+	 * Must return an object that matches `TParameters`.
+	 */
+	prepareArguments?: (args: unknown) => Static<TParameters>;
+	/**
+	 * JSON Schema of `structuredContent` in successful results. Tools that declare it should always
+	 * set `structuredContent`.
+	 */
+	outputSchema?: TSchema;
+	/**
+	 * Execute the tool call. Throw on failure, or return a result with `isError: true`; do not only
+	 * describe the failure in `content`.
+	 */
+	execute: (
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails>,
+	) => Promise<AgentToolResult<TDetails>>;
+	/** Recovery policy for an effect whose durable intent exists but whose outcome is unknown. */
+	replay?: "never" | "safe";
+	/**
+	 * Per-tool execution mode override.
+	 * - "sequential": this tool must execute one at a time with other tool calls.
+	 * - "parallel": this tool can execute concurrently with other tool calls.
+	 *
+	 * If omitted, the default execution mode applies.
+	 */
+	executionMode?: ToolExecutionMode;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L466</b><span>继承自 <code>Tool</code>，后者提供 <code>name</code>、<code>description</code>、<code>parameters</code>（TypeBox schema）。这四个字段就是模型看到的合同。</span></li>
+              <li><b>L473</b><span><code>prepareArguments</code> 在 schema 校验<strong>之前</strong>运行，用来兼容模型发来的畸形参数（JSON 字符串、别名、缺省包装）。</span></li>
+              <li><b>L483</b><span><code>execute</code> 拿到的是已校验、已规范化的参数，不需要再防御类型。</span></li>
+              <li><b>L486</b><span><code>signal</code> 用于协作式取消；工具应把它传给子进程/网络请求，而不是忽略。</span></li>
+              <li><b>L490</b><span><code>replay</code> 是给持久化执行/恢复用的：有副作用且结果未知的工具应标 <code>"never"</code>，避免自动重放。</span></li>
+              <li><b>L498</b><span><code>executionMode: "sequential"</code> 会让整个批次降级为串行，用于有共享状态的工具。</span></li>
+            </ul>
+          </div>
+
+          <p>产品层还有更丰富的 <code>ToolDefinition</code>：它多了 <code>promptSnippet</code>、<code>promptGuidelines</code>、<code>renderCall</code>、<code>renderResult</code>、<code>exposure</code>、<code>constrainedSampling</code> 等。内核只认 <code>AgentTool</code>；这些产品字段在装配时被消费——提示进入系统提示，渲染器进入 TUI，schema 进入 provider 请求。</p>
+
+          <h2 id="results"><span class="h2-num">6.2</span>工具结果：一份结果，三种读者</h2>
+          <p><code>AgentToolResult</code> 的字段分工，是 pi 工具设计里最值得借鉴的部分：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>字段</th><th>读者</th><th>是否进上下文</th><th>用途</th></tr></thead>
+              <tbody>
+                <tr><td><code>content</code></td><td>模型</td><td>是</td><td>文本/图片。应当简洁，只包含模型决策所需信息。</td></tr>
+                <tr><td><code>details</code></td><td>UI / 扩展 / 日志</td><td>否</td><td>完整结构，例如 diff、截断信息、文件列表。</td></tr>
+                <tr><td><code>structuredContent</code></td><td>程序调用者</td><td>否</td><td>匹配 <code>outputSchema</code> 的机器可读结果，codemode 直接消费。</td></tr>
+                <tr><td><code>usage</code></td><td>计费</td><td>否</td><td>工具内部调用模型的花费（如子 agent）。</td></tr>
+                <tr><td><code>isError</code></td><td>模型 / 循环</td><td>是（标记）</td><td>让失败成为可重试的上下文，而不是异常。</td></tr>
+                <tr><td><code>terminate</code></td><td>循环</td><td>否</td><td>整批一致时提前结束自动续跑。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="callout tip">
+            <div class="callout-title">实践建议</div>
+            <p>写工具时先问：<strong>模型需要看到多少？</strong> 例如 <code>grep</code> 的 details 可以包含全部命中，content 只给前 N 条加一句“还有 237 条，可用 offset 继续”。这比把几万行塞进上下文更能让模型做对下一步。</p>
+          </div>
+
+          <h2 id="builtins"><span class="h2-num">6.3</span>八个内置工具的设计取舍</h2>
+          <p>pi 的内置工具刻意保持“Unix 小工具”风格，而不是提供一个万能 <code>computer</code> 工具。默认集合是：<code>read</code>、<code>bash</code>、<code>edit</code>、<code>write</code>、<code>grep</code>、<code>find</code>、<code>ls</code>，Windows 上还有 <code>powershell</code>。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>工具</th><th>关键设计</th><th>为什么</th></tr></thead>
+              <tbody>
+                <tr><td><code>read</code></td><td>offset/limit 分页；图片自动缩放；默认最多 2000 行 / 50KB</td><td>大文件不能一次塞满上下文；图片要按模型限制缩放。</td></tr>
+                <tr><td><code>edit</code></td><td>多个 <code>oldText/newText</code>，全部基于<strong>原始文件</strong>匹配；不重叠</td><td>一次调用完成多处修改，减少往返；避免增量匹配的歧义。</td></tr>
+                <tr><td><code>write</code></td><td>整文件覆盖；自动建父目录；走文件队列</td><td>适合新建或完整重写，不适合局部修改。</td></tr>
+                <tr><td><code>bash</code></td><td>合并 stdout/stderr；可流式更新；尾部截断；完整输出存临时文件</td><td>命令输出通常“最后几行最重要”；截断后仍能给出完整路径。</td></tr>
+                <tr><td><code>grep</code></td><td>按行截断（默认 500 字符）；结果分页</td><td>避免单行超长（压缩后的 JS）撑爆上下文。</td></tr>
+                <tr><td><code>find</code></td><td>按 glob/名称查找；限制结果数</td><td>大仓库里“找文件”本身可能产生海量输出。</td></tr>
+                <tr><td><code>ls</code></td><td>目录列表；隐藏文件可选</td><td>比 bash 更安全、输出更稳定。</td></tr>
+                <tr><td><code>powershell</code></td><td>Windows 专用，独立 shell 配置</td><td>不把平台差异塞进 bash 工具。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>read：分页而不是“读整个文件”</h3>
+          <p><code>read</code> 的 schema 只有三个字段，却决定了模型能否在大仓库里工作：</p>
+          <pre class="plain-tree">const readSchema = Type.Object({
+  path:   Type.String({ description: "Path to the file to read (relative or absolute)" }),
+  offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
+  limit:  Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+});</pre>
+          <p>截断策略是“头截断”：保留前 2000 行或前 50KB，谁先到算谁。返回的 <code>details.truncation</code> 包含总行数、总字节、命中哪个限制，模型可以据此决定是否用 <code>offset</code> 继续读。图片走另一条路径：检测 MIME、按模型输入限制缩放、返回 image block；若模型不支持图片，则用一句提示替代。</p>
+
+          <h3>edit：基于原文的多点替换</h3>
+          <p>编辑工具不接受行号，也不接受正则，而是要求 <code>oldText</code> 在文件中<strong>唯一且精确匹配</strong>。这看起来苛刻，但消除了几类常见错误：行号漂移、缩进不一致、正则误匹配。多个 edit 都在原始内容上匹配，因此调用者必须保证它们不重叠。</p>
+          <p>这个约束也把“如何改”推回给模型：它必须先读文件、复制精确文本。对 agent 来说，这比“猜行号”更可靠。</p>
+
+          <h3>bash：尾部截断 + 完整输出落盘</h3>
+          <p>命令输出与文件读取相反：通常最后几行才是关键（错误、测试摘要）。所以 bash 用 <code>truncateTail</code>，保留最后 2000 行 / 50KB，并在内容末尾附上：</p>
+          <pre class="plain-tree">[Showing lines 812-2811 of 2811 (50.0KB limit). Full output: /tmp/pi-bash-….log]</pre>
+          <p>模型因此知道“输出被截断了”，也能在需要时用 <code>read</code> 打开完整文件。<code>timeout</code> 是可选的，且没有默认值——长命令（构建、测试）不应该被一个拍脑袋的默认值杀掉。</p>
+
+          <h2 id="queue"><span class="h2-num">6.4</span>并行工具下的文件竞态</h2>
+          <p>agent loop 默认并行执行工具。如果同一批里有 <code>edit a.ts</code> 和 <code>write a.ts</code>，天真的实现会互相覆盖。pi 用<strong>按真实路径串行化</strong>的队列解决，而不是把 edit/write 标记为全局串行：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/tools/file-mutation-queue.ts" data-lang="ts" data-start="32" data-highlight="2-11,15-21,23-26">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/tools/file-mutation-queue.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export async function withFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+	const registration = registrationQueue.then(async () => {
+		const key = await getMutationQueueKey(filePath);
+		const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
+
+		let releaseNext!: () => void;
+		const nextQueue = new Promise<void>((resolveQueue) => {
+			releaseNext = resolveQueue;
+		});
+		const chainedQueue = currentQueue.then(() => nextQueue);
+		fileMutationQueues.set(key, chainedQueue);
+
+		return { key, currentQueue, chainedQueue, releaseNext };
+	});
+	registrationQueue = registration.then(
+		() => undefined,
+		() => undefined,
+	);
+
+	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+	await currentQueue;
+	try {
+		return await fn();
+	} finally {
+		releaseNext();
+		if (fileMutationQueues.get(key) === chainedQueue) {
+			fileMutationQueues.delete(key);
+		}
+	}
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L33</b><span><code>registrationQueue</code> 把“注册到哪个队列”这个动作本身串行化，避免两个调用同时创建同一个文件的队列。</span></li>
+              <li><b>L34</b><span><code>getMutationQueueKey()</code> 优先用 <code>realpath</code>，这样符号链接和真实路径会落到同一个队列。<code>ENOENT</code> 时退回解析后的路径（文件还不存在）。</span></li>
+              <li><b>L38-41</b><span>经典的 Promise 链：当前任务完成后才 <code>releaseNext()</code>，后续任务在 <code>currentQueue</code> 上等待。</span></li>
+              <li><b>L52</b><span>不同文件的队列互不影响，因此并行度保留；只有同一文件被串行化。</span></li>
+              <li><b>L57</b><span><code>finally</code> 保证异常也会释放队列；最后一个等待者清理 Map，避免内存泄漏。</span></li>
+            </ul>
+          </div>
+
+          <p>这个队列只保护“经由 pi 工具发起的写入”。外部进程（例如用户同时跑 <code>npm run format</code>）仍可能竞争。要更强的一致性，需要文件锁或版本控制层的冲突检测——pi 把这个问题留给环境，而不是在内核里做分布式锁。</p>
+
+          <h2 id="surfaces"><span class="h2-num">6.5</span>五种接口，一个内核</h2>
+          <p>pi 的产品形态不是“一个 CLI”，而是同一 <code>AgentSession</code> 的多个投影。输入输出的差异被限制在 mode 层，内核不感知终端、JSON 管道或 RPC 客户端。</p>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 300" role="img" aria-label="五种运行接口共享内核">
+                <defs>
+                  <marker id="s6" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <rect class="dg-box" x="16" y="30" width="132" height="54"></rect>
+                <text class="dg-label" x="30" y="52">interactive</text>
+                <text class="dg-sub" x="30" y="68">TUI · 默认</text>
+
+                <rect class="dg-box" x="16" y="104" width="132" height="54"></rect>
+                <text class="dg-label" x="30" y="126">print</text>
+                <text class="dg-sub" x="30" y="142">--print / 非 TTY</text>
+
+                <rect class="dg-box" x="16" y="178" width="132" height="54"></rect>
+                <text class="dg-label" x="30" y="200">json</text>
+                <text class="dg-sub" x="30" y="216">--mode json</text>
+
+                <rect class="dg-box" x="16" y="252" width="132" height="40"></rect>
+                <text class="dg-label" x="30" y="277">rpc</text>
+
+                <rect class="dg-box-accent" x="240" y="104" width="170" height="90"></rect>
+                <text class="dg-label" x="256" y="132">AgentSession</text>
+                <text class="dg-sub" x="256" y="150">prompt / steer / abort</text>
+                <text class="dg-sub" x="256" y="168">同一套工具与会话</text>
+
+                <rect class="dg-box-teal" x="500" y="30" width="160" height="54"></rect>
+                <text class="dg-label" x="514" y="52">TUI renderer</text>
+                <text class="dg-sub" x="514" y="68">差分终端</text>
+
+                <rect class="dg-box" x="500" y="104" width="160" height="54"></rect>
+                <text class="dg-label" x="514" y="126">text output</text>
+                <text class="dg-sub" x="514" y="142">最后一条 assistant</text>
+
+                <rect class="dg-box" x="500" y="178" width="160" height="54"></rect>
+                <text class="dg-label" x="514" y="200">JSONL events</text>
+                <text class="dg-sub" x="514" y="216">session header + events</text>
+
+                <rect class="dg-box" x="500" y="252" width="160" height="40"></rect>
+                <text class="dg-label" x="514" y="277">commands / events</text>
+
+                <rect class="dg-box-ochre" x="240" y="30" width="170" height="46"></rect>
+                <text class="dg-label" x="256" y="57">SDK（进程内）</text>
+
+                <path class="dg-line" d="M148 57 H240" marker-end="url(#s6)"></path>
+                <path class="dg-line" d="M148 131 H240" marker-end="url(#s6)"></path>
+                <path class="dg-line" d="M148 205 H240" marker-end="url(#s6)"></path>
+                <path class="dg-line" d="M148 272 H200 V194 H240" marker-end="url(#s6)"></path>
+                <path class="dg-line-dash" d="M410 57 V104" marker-end="url(#s6)"></path>
+                <path class="dg-line" d="M410 131 H500" marker-end="url(#s6)"></path>
+                <path class="dg-line" d="M410 150 V178 H500" marker-end="url(#s6)"></path>
+                <path class="dg-line" d="M410 169 V252 H500" marker-end="url(#s6)"></path>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 6-1</b> 五种接口共享同一个会话与工具集；差别只在传输、生命周期与渲染。</figcaption>
+          </figure>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>接口</th><th>传输</th><th>生命周期</th><th>适用</th></tr></thead>
+              <tbody>
+                <tr><td>interactive</td><td>终端（TUI）</td><td>长驻，多轮</td><td>人类日常使用；需要交互确认、图像、快捷键。</td></tr>
+                <tr><td>print</td><td>stdout 文本</td><td>一次调用</td><td>脚本、CI；<code>--print</code> 或非 TTY 自动选择。</td></tr>
+                <tr><td>json</td><td>JSONL</td><td>一次调用</td><td>结构化消费：先 header，再 session events。</td></tr>
+                <tr><td>rpc</td><td>JSONL 双向</td><td>长驻子进程</td><td>IDE、其他语言、需要进程隔离的宿主。</td></tr>
+                <tr><td>SDK</td><td>进程内 TypeScript</td><td>宿主控制</td><td>Node/Bun 应用嵌入；直接操作 session 与事件。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>JSON 与 RPC 的区别不只是“有没有 header”</h3>
+          <p>JSON 模式是<strong>单向事件流</strong>：进程启动、执行给定 prompt、输出事件、退出。RPC 模式是<strong>双向协议</strong>：stdin 发 command，stdout 收 response 与 event，进程长期存活，客户端可以随时 <code>prompt</code>、<code>get_state</code>、<code>set_model</code>、<code>abort</code>。</p>
+          <p>两者共享同一套事件形状，但生命周期语义不同。最容易踩的坑是把 <code>agent_end</code> 当成“彻底结束”：它只表示一次低层 run 结束，之后还可能有自动重试、压缩恢复、steering 或 follow-up。真正表示“不会自动继续”的是 <code>agent_settled</code>。</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/main.ts" data-lang="ts" data-start="112" data-highlight="4-12">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/main.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
+	if (parsed.mode === "rpc") {
+		return "rpc";
+	}
+	if (parsed.mode === "json") {
+		return "json";
+	}
+	if (parsed.print || !stdinIsTTY || !stdoutIsTTY) {
+		return "print";
+	}
+	return "interactive";
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L112</b><span>显式的 <code>--mode</code> 优先，其次是 <code>--print</code>，最后根据 TTY 自动判断。管道输入/输出默认非交互，这让 <code>echo ... | pi</code> 自然工作。</span></li>
+              <li><b>L118</b><span>“任一端不是 TTY”就进入 print。CI 里不需要额外 flag，也不会尝试启动 TUI。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="critique"><span class="h2-num">6.6</span>设计评价</h2>
+          <p>这套工具层的优点是<strong>边界清晰</strong>：schema、执行、结果、渲染、提示贡献分别有位置；内核只依赖最小接口。新增一个工具不需要改循环，也不需要改 provider。</p>
+          <p>但它也把不少责任推给工具作者：</p>
+          <ul>
+            <li>你必须自己想清楚 content 与 details 的分工，否则要么上下文爆炸，要么 UI 信息不足。</li>
+            <li>你必须遵守 <code>signal</code> 与 <code>onUpdate</code> 的约定，否则取消不生效、流式输出卡顿。</li>
+            <li>文件类工具必须使用提供的队列，否则并行批次里会出现丢失更新。</li>
+            <li>工具描述与 <code>promptGuidelines</code> 会直接影响模型行为；写得含糊，模型就会误用。</li>
+          </ul>
+          <p>从教学角度看，内置工具是很好的“如何为模型设计 API”的样本：短描述、强约束、可恢复错误、明确的输出上限。这些原则比具体实现更值得带走。</p>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li><code>content</code>、<code>details</code>、<code>structuredContent</code> 分别给谁看？</li>
+              <li>为什么 <code>edit</code> 要求 <code>oldText</code> 在原文中唯一，而不是按行号修改？</li>
+              <li>并行批次里两个工具改同一个文件，pi 如何避免竞态？这个方案保护不了什么？</li>
+              <li>JSON 模式与 RPC 模式的生命周期差异是什么？应该等哪个事件表示“彻底结束”？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：扩展系统</span>
+            <span>Figure 6-1</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

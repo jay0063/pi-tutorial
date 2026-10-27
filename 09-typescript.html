@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · TypeScript 精要 — pi 源码之旅</title>
+<meta name="description" string="true">用 pi 的真实代码讲透可辨识联合、条件类型、泛型、品牌类型、async iterable、声明合并与 NodeNext。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">TypeScript 精要</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 09 · language</div>
+            <h1>类型不是注释，<br>是运行时的合同</h1>
+            <p class="lead">pi 把大量正确性放进类型系统：消息联合、事件状态机、provider 差异、扩展自定义消息。这一章不教语法，而是用 pi 的真实代码解释<strong>为什么这样写</strong>，以及你能从中带走哪些模式。</p>
+            <div class="meta-row">
+              <span>阅读约 32 分钟</span>
+              <span>8 个语言特性</span>
+              <span>全部取自源码</span>
+            </div>
+          </header>
+
+          <h2 id="compiler"><span class="h2-num">9.1</span>先读 tsconfig：一份设计声明</h2>
+          <p>pi 的 <code>tsconfig.base.json</code> 只有二十来行，却透露了很多取向：</p>
+
+          <pre class="plain-tree">{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "Node16",
+    "lib": ["ES2024"],
+    "strict": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  }
+}</pre>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>选项</th><th>含义</th><th>影响</th></tr></thead>
+              <tbody>
+                <tr><td><code>strict</code></td><td>全套严格检查</td><td>禁止隐式 any、严格空值、严格函数类型。pi 的代码几乎没有 <code>any</code> 滥用，靠的就是这个。</td></tr>
+                <tr><td><code>erasableSyntaxOnly</code></td><td>只允许“擦除后不留下运行时代码”的语法</td><td>不能用 <code>enum</code>、<code>namespace</code>、构造函数参数属性。这让 Node 的原生类型剥离可以直接跑源码。</td></tr>
+                <tr><td><code>verbatimModuleSyntax</code></td><td>导入/导出原样保留</td><td>类型导入必须写 <code>import type</code>，否则运行时可能保留不存在的导出。</td></tr>
+                <tr><td><code>allowImportingTsExtensions</code></td><td>允许 <code>import "./x.ts"</code></td><td>源码里直接引用 <code>.ts</code>，开发者不需要记住构建后的文件名。</td></tr>
+                <tr><td><code>rewriteRelativeImportExtensions</code></td><td>构建时把 <code>.ts</code> 改成 <code>.js</code></td><td>发布产物仍是标准 ESM，Node 能直接运行。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这套组合的目标很明确：<strong>源码即运行时代码</strong>。没有装饰器元数据、没有 enum 对象、没有路径别名魔法，Node 22 的类型剥离可以直接执行 <code>.ts</code>。代价是失去一些“编译期便利”，换来更简单的调试与更快的启动。</p>
+
+          <h2 id="union"><span class="h2-num">9.2</span>可辨识联合：事件状态机的骨架</h2>
+          <p><code>AssistantMessageEvent</code> 是 pi 里最典型的可辨识联合。每个成员都有一个字面量 <code>type</code>，其余字段随类型变化：</p>
+
+          <div class="code-panel" data-file="packages/ai/src/types.ts" data-lang="ts" data-start="821" data-highlight="2-4,10-11,13-17">
+            <div class="code-head">
+              <span class="path">packages/ai/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export type AssistantMessageEvent =
+	| { type: "start"; partial: AssistantMessage }
+	| { type: "text_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "text_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "text_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
+	| { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
+	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
+	| { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
+	| {
+			type: "done";
+			reason: Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">;
+			message: AssistantMessage;
+	  }
+	| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage };
+            </script>
+            <ul class="code-notes">
+              <li><b>L822-831</b><span>流式事件都带 <code>partial</code>：到目前为止的完整消息。消费者不需要自己拼状态。</span></li>
+              <li><b>L832</b><span><code>Extract&lt;StopReason, ...&gt;</code> 把 <code>done</code> 的 reason 限制为“正常结束”的子集；<code>error</code> 则限制为错误/中止。这比在运行时检查更早暴露错误。</span></li>
+              <li><b>L837</b><span><code>error</code> 事件没有 <code>partial</code>，而是完整的 <code>error</code> 消息——终止状态携带最终结果，而不是中间快照。</span></li>
+            </ul>
+          </div>
+
+          <p>消费端因此可以写穷尽 switch。TypeScript 会根据 <code>type</code> 自动收窄字段；如果你漏了一个分支，把剩余值赋给 <code>never</code> 就会编译失败：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/messages.ts" data-lang="ts" data-start="184" data-highlight="5-7">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/messages.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+				case "system":
+				case "user":
+				case "assistant":
+				case "toolResult":
+					return m;
+				default:
+					// biome-ignore lint/correctness/noSwitchDeclarations: fine
+					const _exhaustiveCheck: never = m;
+					return undefined;
+            </script>
+            <ul class="code-notes">
+              <li><b>L189-192</b><span>这是“穷尽性检查”的惯用法：如果未来新增一种消息角色而这里没处理，<code>m</code> 的类型就不是 <code>never</code>，赋值失败。</span></li>
+              <li><b>L184-187</b><span>基础 LLM 消息直接透传；自定义消息在此前已被转换成 user/toolResult 等形态。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="conditional"><span class="h2-num">9.3</span>条件类型：让数据形状跟着 API 变</h2>
+          <p>不同 provider 的兼容参数完全不同。pi 没有用一个巨大的可选字段包打天下，而是让 <code>Model</code> 的 <code>compat</code> 字段<strong>由泛型参数决定</strong>：</p>
+
+          <div class="code-panel" data-file="packages/ai/src/types.ts" data-lang="ts" data-start="876" data-highlight="1-11">
+            <div class="code-head">
+              <span class="path">packages/ai/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+		compat?: TApi extends "openai-completions"
+			? OpenAICompletionsCompat
+			: TApi extends "openai-responses" | "azure-openai-responses" | "openai-codex-responses"
+				? OpenAIResponsesCompat
+				: TApi extends "anthropic-messages"
+					? AnthropicMessagesCompat
+					: TApi extends "bedrock-converse-stream"
+						? BedrockCompat
+						: TApi extends "mistral-conversations"
+							? MistralConversationsCompat
+							: never;
+            </script>
+            <ul class="code-notes">
+              <li><b>L876</b><span>条件类型按 API 名分发。当 <code>TApi = "anthropic-messages"</code> 时，<code>compat</code> 的类型就是 <code>AnthropicMessagesCompat</code>，IDE 能给出精确补全。</span></li>
+              <li><b>L886</b><span>未知 API 落到 <code>never</code>，意味着不能传 compat。要支持新 API，必须显式加分支——这是有意的“封闭扩展”。</span></li>
+              <li><b>Model&lt;TApi&gt;</b><span>整个接口都带这个参数，因此模型目录、适配器、工具都能共享同一份精确类型。</span></li>
+            </ul>
+          </div>
+
+          <p>同类技巧也用在 stream options 上：<code>ApiStreamOptions&lt;TApi&gt;</code> 先查 <code>ApiOptionsMap</code>，命中就用该 API 的选项类型，否则退回通用 <code>StreamOptions &amp; Record&lt;string, unknown&gt;</code>。这让简单调用保持类型安全，又允许自定义 provider 传额外字段。</p>
+
+          <h2 id="brand"><span class="h2-num">9.4</span>品牌类型：让“未归一化”无法通过编译</h2>
+          <p>pi 的 provider 只接受 <code>TranscriptContext</code>，而不是任意 <code>Context</code>。区别是一个编译期品牌：</p>
+
+          <div class="code-panel" data-file="packages/ai/src/types.ts" data-lang="ts" data-start="792" data-highlight="1,9-11">
+            <div class="code-head">
+              <span class="path">packages/ai/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+declare const transcriptContextBrand: unique symbol;
+
+/**
+ * Normalized request context passed to providers and API implementations. The
+ * prompt and tool declarations are carried by the transcript's system messages.
+ * Only `normalizeContext()` produces this type, so a raw `Context` cannot reach
+ * provider code by accident.
+ */
+export type TranscriptContext = {
+	messages: Message[];
+	readonly [transcriptContextBrand]: true;
+};
+            </script>
+            <ul class="code-notes">
+              <li><b>L792</b><span><code>unique symbol</code> 无法在别处重新声明，因此外部代码无法伪造这个属性。它不是运行时字段，只存在于类型层。</span></li>
+              <li><b>L800-803</b><span>归一化后的类型只暴露 <code>messages</code>；<code>systemPrompt</code> 与 <code>tools</code> 已经被折进 system 消息。</span></li>
+              <li><b>L33（transcript.ts）</b><span>唯一的生产者是 <code>normalizeContext()</code>：<code>return { messages } as TranscriptContext</code>。这个 <code>as</code> 是受控的“类型逃生舱”，集中在一处。</span></li>
+            </ul>
+          </div>
+
+          <p>品牌类型的价值在于<strong>把运行时约定前移到编译期</strong>。没有它，一个忘了归一化的调用要等到 provider 收到缺系统提示的请求才暴露；有了它，编辑器立刻报错。</p>
+
+          <h2 id="generic"><span class="h2-num">9.5</span>泛型与 TypeBox：一份 schema，两种用途</h2>
+          <p>工具参数用 TypeBox 定义。它既是运行时的 JSON Schema（发给 provider 做约束采样/校验），也是编译期的类型来源：</p>
+
+          <pre class="plain-tree">const readSchema = Type.Object({
+  path:   Type.String({ description: "Path to the file to read (relative or absolute)" }),
+  offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
+  limit:  Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+});
+
+export type ReadToolInput = Static&lt;typeof readSchema&gt;;
+// { path: string; offset?: number; limit?: number }</pre>
+
+          <p>这里有三层泛型协作：</p>
+          <ol>
+            <li><code>Type.Object()</code> 返回一个携带静态类型的 schema 对象；</li>
+            <li><code>Static&lt;T&gt;</code> 把 schema 类型映射成普通对象类型；</li>
+            <li><code>AgentTool&lt;TParameters&gt;</code> 用 <code>Static&lt;TParameters&gt;</code> 约束 <code>execute</code> 的 <code>params</code>。</li>
+          </ol>
+          <p>结果：你只写一次字段定义，运行时校验和编译期补全自动一致。改字段名时，忘改 <code>execute</code> 里的解构会立刻报错。</p>
+
+          <p><code>defineTool()</code> 是另一项技巧：它保留字面量推断。直接写对象字面量传给 <code>registerTool</code>，<code>params</code> 可能被上下文类型放宽为 <code>unknown</code>；<code>defineTool</code> 通过泛型约束把具体 schema 的类型保留下来。</p>
+
+          <h2 id="async"><span class="h2-num">9.6</span>AsyncIterable：把流变成可组合的序列</h2>
+          <p><code>EventStream</code> 实现了 <code>AsyncIterable&lt;T&gt;</code>，因此消费者可以写：</p>
+
+          <pre class="plain-tree">for await (const event of stream) {
+  if (event.type === "text_delta") process.stdout.write(event.delta);
+  if (event.type === "done") break;
+}
+const final = await stream.result();</pre>
+
+          <p>这比回调好在三点：</p>
+          <ul>
+            <li><strong>背压的语法位置</strong>：<code>await</code> 天然让消费慢下来（虽然 <code>EventStream</code> 内部是无界缓冲，但接口允许未来换成有界实现）。</li>
+            <li><strong>取消</strong>：<code>break</code> 会调用迭代器的 <code>return()</code>，生产者可以据此清理。</li>
+            <li><strong>组合</strong>：可以写 <code>for await</code> 嵌套、<code>Promise.race</code>、超时包装，而不需要适配回调协议。</li>
+          </ul>
+          <p>注意实现里的一个细节：<code>async *[Symbol.asyncIterator]()</code> 生成器与 <code>result()</code> Promise 并存。这允许“只关心最终消息”的调用者不消费流，同时不阻塞生产者。</p>
+
+          <h2 id="merging"><span class="h2-num">9.7</span>声明合并：让扩展增加消息类型</h2>
+          <p>pi 的 <code>AgentMessage</code> 默认只有四种 LLM 消息，但扩展可以注入自定义消息（例如 todo、artifact）。实现方式是“空接口 + 索引访问”：</p>
+
+          <div class="code-panel" data-file="packages/agent/src/types.ts" data-lang="ts" data-start="351" data-highlight="8-10,14-16">
+            <div class="code-head">
+              <span class="path">packages/agent/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+/**
+ * Extensible interface for custom app messages.
+ * Apps can extend via declaration merging:
+ *
+ * @example
+ * ```typescript
+ * declare module "@mariozechner/agent" {
+ *   interface CustomAgentMessages {
+ *     artifact: ArtifactMessage;
+ *     notification: NotificationMessage;
+ *   }
+ * }
+ * ```
+ */
+export interface CustomAgentMessages {
+	// Empty by default - apps extend via declaration merging
+}
+
+/**
+ * AgentMessage: Union of LLM messages + custom messages.
+ * This abstraction allows apps to add custom message types while maintaining
+ * type safety and compatibility with the base LLM messages.
+ */
+export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
+            </script>
+            <ul class="code-notes">
+              <li><b>L365-367</b><span>空接口不是“没用的占位”，而是给模块增强留的插槽。接口声明合并会把扩展字段加进来。</span></li>
+              <li><b>L374</b><span><code>keyof CustomAgentMessages</code> 取出所有键，再用索引访问得到所有自定义消息的联合。空接口时 <code>keyof</code> 是 <code>never</code>，所以联合就是基础 <code>Message</code>。</span></li>
+              <li><b>L358</b><span>示例里的模块名是旧包名；实际使用时写当前包名。声明合并是全局的，整个进程内所有扩展共享同一套消息类型。</span></li>
+            </ul>
+          </div>
+
+          <p>这也解释了为什么 <code>convertToLlm()</code> 里的 switch 需要 <code>_exhaustiveCheck: never</code>：一旦扩展增加了新角色，编译器会强制你处理它，否则自定义消息会悄悄变成 <code>undefined</code>。</p>
+
+          <h2 id="satisfies"><span class="h2-num">9.8</span><code>satisfies</code>：检查而不拓宽</h2>
+          <p>普通类型注解会把字面量拓宽成基础类型；<code>satisfies</code> 只做兼容性检查，保留字面量推断：</p>
+
+          <pre class="plain-tree">const finalized = {
+  toolCall,
+  result: createErrorToolResult("Operation aborted"),
+  isError: true,
+} satisfies FinalizedToolCallOutcome;</pre>
+
+          <p>这样 <code>finalized.result</code> 的精确类型（而不是 <code>any</code>）被保留，后续访问字段有补全；同时编译器仍会检查对象是否符合 <code>FinalizedToolCallOutcome</code>。pi 在 loop、工具结果、provider 适配器里大量使用这个模式。</p>
+
+          <p>另一个常见组合是 <code>as const</code>：</p>
+          <pre class="plain-tree">export const readToolSystemPromptContribution = {
+  snippet: "Read file contents",
+  guidelines: ["Use read to examine files instead of cat or sed."],
+} as const;</pre>
+          <p><code>as const</code> 让字符串字面量与数组变成只读精确类型，避免被推断成 <code>string</code> 或 <code>string[]</code>，从而能安全地拼进系统提示而不被意外修改。</p>
+
+          <h2 id="modules"><span class="h2-num">9.9</span>NodeNext / ESM：包边界就是 API 边界</h2>
+          <p>每个 package 都是 <code>"type": "module"</code>，并通过 <code>exports</code> 映射暴露入口：</p>
+          <pre class="plain-tree">{
+  "name": "@earendil-works/pi-agent-core",
+  "type": "module",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  }
+}</pre>
+          <p>这带来几个约束：</p>
+          <ul>
+            <li>相对导入必须带扩展名（源码写 <code>.ts</code>，构建后重写为 <code>.js</code>）。</li>
+            <li>不能在 ESM 里用 <code>__dirname</code>；pi 用 <code>import.meta.url</code>。</li>
+            <li>类型导入用 <code>import type</code>，否则 <code>verbatimModuleSyntax</code> 会保留运行时导入。</li>
+            <li>包的公共 API 由 <code>exports</code> 决定；深层路径不暴露，防止外部依赖内部结构。</li>
+          </ul>
+
+          <p>这套边界对 agent 项目很重要：provider 适配器、TUI、工具都通过明确的包接口协作，而不是互相 <code>../../</code> 乱穿。读源码时，先看 <code>exports</code> 与 <code>index.ts</code>，能快速判断哪些是稳定 API、哪些是内部实现。</p>
+
+          <h2 id="takeaway"><span class="h2-num">9.10</span>可以带走什么</h2>
+          <div class="grid-2">
+            <div class="mini-card">
+              <h4>用联合表达状态</h4>
+              <p>不要用一堆布尔字段表示“正在流式/已完成/出错”。一个带 <code>type</code> 的联合让非法状态无法构造。</p>
+            </div>
+            <div class="mini-card">
+              <h4>把不变量放进类型</h4>
+              <p>品牌类型、<code>never</code> 分支、<code>Extract</code> 子集，都是把运行时约定前移的手段。</p>
+            </div>
+            <div class="mini-card">
+              <h4>一份 schema 两处用</h4>
+              <p>TypeBox/JSON Schema + <code>Static</code> 避免“校验一套、类型一套”的漂移。</p>
+            </div>
+            <div class="mini-card">
+              <h4>让扩展点类型安全</h4>
+              <p>空接口 + 声明合并 + 穷尽检查，可以在不修改核心的情况下增加消息类型。</p>
+            </div>
+          </div>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li><code>erasableSyntaxOnly</code> 为什么禁止 <code>enum</code>？这对运行方式有什么影响？</li>
+              <li>条件类型里的 <code>never</code> 分支是缺陷还是特性？</li>
+              <li>品牌类型能防止哪一类 bug？它能在运行时阻止伪造吗？</li>
+              <li>声明合并增加消息类型后，为什么必须更新 <code>convertToLlm</code>？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：大模型基础</span>
+            <span>8 language patterns</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

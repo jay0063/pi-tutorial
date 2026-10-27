@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · 会话树与上下文投影 — pi 源码之旅</title>
+<meta name="description" content="pi 的 JSONL 会话格式、id/parentId 树、leaf 指针、压缩边界、上下文编辑与分支摘要。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">会话树与上下文</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 05 · SessionManager</div>
+            <h1>只追加的文件，<br>可重写的过去</h1>
+            <p class="lead">pi 的会话是一个 <strong>JSONL 树</strong>：每条记录有 <code>id</code> 和 <code>parentId</code>，一个 <code>leafId</code> 指针决定当前分支。压缩、编辑、分支摘要都不删除旧行，而是追加新事实，再通过投影决定模型看见什么。</p>
+            <div class="meta-row">
+              <span>阅读约 30 分钟</span>
+              <span>关键文件 2 个</span>
+              <span>2 个交互演示</span>
+            </div>
+          </header>
+
+          <h2 id="why"><span class="h2-num">5.1</span>为什么不用数据库</h2>
+          <p>一个会话文件就是一个追加写的 JSONL。这个选择带来几个直接好处：</p>
+          <ul>
+            <li><strong>可恢复</strong>：进程崩溃最多丢最后一行；前面的内容仍可读。</li>
+            <li><strong>可审计</strong>：模型看到的、用户改过的、压缩掉的，全都有原始记录。</li>
+            <li><strong>可分支</strong>：回到任意历史点继续，不需要复制整个会话。</li>
+            <li><strong>易分享/导出</strong>：纯文本，不依赖数据库版本。</li>
+          </ul>
+          <p>代价是：查询要线性扫描；文件会越来越大；并发写需要外部约束。pi 接受这些代价，因为单机会话的规模有限，而“历史不可变”带来的调试价值更高。</p>
+
+          <h2 id="format"><span class="h2-num">5.2</span>文件格式：一行一个事实</h2>
+          <p>文件第一行是 header，之后每行是一个 entry。header 没有 <code>id/parentId</code>，不属于树：</p>
+
+          <pre class="plain-tree">{"type":"session","version":3,"id":"uuid","timestamp":"…","cwd":"/path/to/project"}
+{"type":"message","id":"a0b1c2d3","parentId":null,"timestamp":"…","message":{...}}
+{"type":"message","id":"d4e5f6a7","parentId":"a0b1c2d3","timestamp":"…","message":{...}}
+{"type":"model_change","id":"…","parentId":"d4e5f6a7","timestamp":"…","provider":"openai","modelId":"gpt-5"}
+{"type":"compaction","id":"…","parentId":"…","summary":"…","firstKeptEntryId":"…","tokensBefore":50000}
+{"type":"context_edit","id":"…","parentId":"…","targetId":"a0b1c2d3","replacement":null}</pre>
+
+          <p>entry 的完整联合类型有十几种：消息、模型切换、思考档位切换、usage、压缩、分支摘要、自定义数据、自定义消息、上下文编辑、标签、会话信息。关键是<strong>只有一部分参与模型上下文</strong>：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>entry</th><th>进入上下文？</th><th>作用</th></tr></thead>
+              <tbody>
+                <tr><td><code>message</code></td><td>是</td><td>system / user / assistant / toolResult 消息。</td></tr>
+                <tr><td><code>custom_message</code></td><td>是</td><td>扩展注入的内容，投影成 user 消息。</td></tr>
+                <tr><td><code>compaction</code></td><td>是（作为摘要）</td><td>替代被压缩的前缀；携带系统提示检查点。</td></tr>
+                <tr><td><code>branch_summary</code></td><td>是（作为摘要）</td><td>切分支时保留被放弃路径的要点。</td></tr>
+                <tr><td><code>context_edit</code></td><td>间接</td><td>改写或隐藏某个目标 entry 的贡献。</td></tr>
+                <tr><td><code>custom</code></td><td>否</td><td>扩展私有状态，重载时扫描恢复。</td></tr>
+                <tr><td><code>usage</code> / <code>label</code> / <code>session_info</code></td><td>否</td><td>计费、书签、显示名。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="path"><span class="h2-num">5.3</span>当前分支 = 从 leaf 走到 root</h2>
+          <p><code>SessionManager</code> 只维护一个可变指针 <code>leafId</code>。所谓“当前会话”就是从 leaf 沿 <code>parentId</code> 向上直到根，再反转。复杂度 O(深度)，不需要遍历整棵树。</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/session-manager.ts" data-lang="ts" data-start="390" data-highlight="6-10,13-15,17-24">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/session-manager.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+function buildSessionPath(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionEntry[] {
+	const index = buildEntryIndex(entries, byId);
+	let leaf: SessionEntry | undefined;
+	if (leafId === null) {
+		return [];
+	}
+	if (leafId) {
+		leaf = index.get(leafId);
+	}
+	leaf ??= entries[entries.length - 1];
+	if (!leaf) {
+		return [];
+	}
+
+	const path: SessionEntry[] = [];
+	let current: SessionEntry | undefined = leaf;
+	while (current) {
+		path.push(current);
+		current = current.parentId ? index.get(current.parentId) : undefined;
+	}
+	path.reverse();
+	return path;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L397</b><span><code>leafId === null</code> 表示“回到第一条消息之前”，用于重新编辑首条输入。<code>undefined</code> 才表示“用最后一条”。这个区分很容易写错。</span></li>
+              <li><b>L403</b><span>没有显式 leaf 时，回退到文件最后一个 entry。这是加载旧会话/损坏指针时的兜底。</span></li>
+              <li><b>L412</b><span>只沿 <code>parentId</code> 走；遇到断链（父节点不存在）就停。加载时孤儿会被当作根处理。</span></li>
+              <li><b>L414</b><span>反转得到从旧到新的顺序。之后所有投影逻辑都假设这个顺序。</span></li>
+            </ul>
+          </div>
+
+          <h3>分支只是移动指针</h3>
+          <div class="code-panel" data-file="packages/coding-agent/src/core/session-manager.ts" data-lang="ts" data-start="1579" data-highlight="4">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/session-manager.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	branch(branchFromId: string): void {
+		if (!this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		this.leafId = branchFromId;
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L1583</b><span>整个“切分支”只有一行：改指针。下一次 <code>appendMessage()</code> 会以这个 entry 为父节点，自然长出新枝。旧枝的 entry 一个字节都没动。</span></li>
+            </ul>
+          </div>
+
+          <p>追加消息同样简单：新 entry 的 <code>parentId</code> 取当前 <code>leafId</code>，写入文件，然后把 <code>leafId</code> 前移。</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/session-manager.ts" data-lang="ts" data-start="1204" data-highlight="4-9">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/session-manager.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			message,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L1207</b><span><code>generateId(this.byId)</code> 生成 8 位十六进制并检查冲突；用完则回退到完整 UUID。</span></li>
+              <li><b>L1208</b><span><code>parentId</code> 是写入瞬间的 leaf。这就是树结构的全部构造逻辑。</span></li>
+              <li><b>L1211</b><span><code>_appendEntry()</code> 先更新内存索引与 leaf，再同步追加到文件。顺序保证“内存里可见的一定已落盘”。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="projection"><span class="h2-num">5.4</span>投影：把树压成一条时间线</h2>
+          <p>模型只接受线性消息数组。投影要做三件事：取当前路径、找到最新压缩边界、应用上下文编辑。先看压缩如何裁剪路径：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/session-manager.ts" data-lang="ts" data-start="476" data-highlight="5-9,11-15,18-21,24-29,31-37">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/session-manager.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export function buildContextEntries(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionEntry[] {
+	const path = buildSessionPath(entries, leafId, byId);
+	let compaction: CompactionEntry | null = null;
+
+	for (const entry of path) {
+		if (entry.type === "compaction") {
+			compaction = entry;
+		}
+	}
+
+	if (!compaction) {
+		return path;
+	}
+
+	const compactionIdx = path.findIndex((entry) => entry.id === compaction.id);
+	if (compactionIdx < 0) {
+		return path;
+	}
+
+	const contextEntries: SessionEntry[] = [compaction];
+	let foundFirstKept = false;
+	for (let i = 0; i < compactionIdx; i++) {
+		const entry = path[i];
+		if (entry.id === compaction.firstKeptEntryId) {
+			foundFirstKept = true;
+		}
+		if (foundFirstKept && !(entry.type === "message" && entry.message.role === "system")) {
+			contextEntries.push(entry);
+		}
+	}
+	contextEntries.push(...path.slice(compactionIdx + 1));
+	return contextEntries;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L481</b><span>先取完整路径。<strong>压缩只影响模型视图，不改变树的形状</strong>。</span></li>
+              <li><b>L484-488</b><span>沿路径找<strong>最新</strong>的 compaction。循环不 break，后面的覆盖前面的。</span></li>
+              <li><b>L501-503</b><span>输出以 compaction 自身开头：它的 summary 会变成一条压缩摘要消息。</span></li>
+              <li><b>L504-510</b><span>从路径头开始，直到遇到 <code>firstKeptEntryId</code> 才开始保留；之前的都被摘要替代。</span></li>
+              <li><b>L509</b><span>保留区间里的 system 消息被跳过：压缩条目携带了 <code>systemMessage</code> 检查点，旧提示不应重复。</span></li>
+              <li><b>L511</b><span>压缩条目之后的 entry 全部保留（包括后续对话）。</span></li>
+            </ul>
+          </div>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 290" role="img" aria-label="压缩前后的上下文">
+                <text class="dg-label" x="20" y="24">压缩前（路径上的 9 个 entry）</text>
+                <g>
+                  <rect class="dg-box" x="20" y="36" width="64" height="34"></rect><text class="dg-sub" x="34" y="57">u1</text>
+                  <rect class="dg-box" x="92" y="36" width="64" height="34"></rect><text class="dg-sub" x="104" y="57">a1</text>
+                  <rect class="dg-box" x="164" y="36" width="64" height="34"></rect><text class="dg-sub" x="176" y="57">t1</text>
+                  <rect class="dg-box" x="236" y="36" width="64" height="34"></rect><text class="dg-sub" x="248" y="57">u2</text>
+                  <rect class="dg-box" x="308" y="36" width="64" height="34"></rect><text class="dg-sub" x="320" y="57">a2</text>
+                  <rect class="dg-box" x="380" y="36" width="64" height="34"></rect><text class="dg-sub" x="392" y="57">t2</text>
+                  <rect class="dg-box" x="452" y="36" width="64" height="34"></rect><text class="dg-sub" x="464" y="57">a3</text>
+                  <rect class="dg-box" x="524" y="36" width="64" height="34"></rect><text class="dg-sub" x="536" y="57">u3</text>
+                  <rect class="dg-box" x="596" y="36" width="64" height="34"></rect><text class="dg-sub" x="608" y="57">a4</text>
+                </g>
+                <path class="dg-line" d="M52 70 V92 H628 V70" marker-end="url(#c5)"></path>
+                <text class="dg-sub" x="300" y="108">全部进入上下文</text>
+
+                <text class="dg-label" x="20" y="148">压缩后（追加一条 compaction）</text>
+                <g>
+                  <rect class="dg-box" x="20" y="160" width="120" height="34"></rect><text class="dg-sub" x="32" y="181">compaction</text>
+                  <rect class="dg-box-ochre" x="148" y="160" width="64" height="34"></rect><text class="dg-sub" x="160" y="181">u3</text>
+                  <rect class="dg-box-ochre" x="220" y="160" width="64" height="34"></rect><text class="dg-sub" x="232" y="181">a4</text>
+                  <rect class="dg-box" x="292" y="160" width="150" height="34"></rect><text class="dg-sub" x="304" y="181">之后的新消息…</text>
+                  <rect class="dg-box-teal" x="500" y="160" width="180" height="34"></rect><text class="dg-sub" x="512" y="181">firstKeptEntryId = u3</text>
+                </g>
+                <path class="dg-line" d="M200 194 V216 H580 V194" marker-end="url(#c5)"></path>
+                <text class="dg-sub" x="270" y="232">模型看到：system + summary + 保留区间</text>
+
+                <text class="dg-sub" x="20" y="272">u1..a2 的原始行仍在 JSONL 里；只是不再进入模型上下文。</text>
+                <defs>
+                  <marker id="c5" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 5-1</b> 压缩是“追加一个边界”，不是“删除前缀”。<code>firstKeptEntryId</code> 之前的消息被 summary 替代。</figcaption>
+          </figure>
+
+          <div class="demo" data-demo="compaction">
+            <div class="demo-head">
+              <span class="title">压缩预算模拟</span>
+              <span class="pill ochre">200k window</span>
+            </div>
+            <div class="demo-body">
+              <div class="demo-note" style="margin-top:0"></div>
+              <div class="budget-bar" style="margin-top:14px"></div>
+              <div class="demo-controls">
+                <input type="range" min="20" max="320" value="180" step="10" aria-label="消息条数">
+                <button class="btn btn-sm" data-compact-toggle type="button">执行压缩</button>
+                <span class="demo-note" data-cut-label style="margin:0"></span>
+              </div>
+              <div class="demo-note">阈值 = 上下文窗口 − 预留输出（默认 16k）。压缩保留最近约 20k tokens 的消息，其余变成摘要。原始记录仍在文件里。</div>
+            </div>
+          </div>
+
+          <h2 id="edits"><span class="h2-num">5.5</span>上下文编辑与分支摘要</h2>
+          <p>有时你不想压缩，只想“让某条消息不再出现在模型上下文里”，或者“把它的内容换掉”。<code>context_edit</code> 就是为此设计的：</p>
+
+          <pre class="plain-tree">{"type":"context_edit","id":"…","parentId":"…",
+ "targetId":"a0b1c2d3",
+ "replacement": null}                          // 完全隐藏
+{"type":"context_edit","id":"…","parentId":"…",
+ "targetId":"a0b1c2d3",
+ "replacement":{"content":[{"type":"text","text":"…"}]}}  // 只换内容</pre>
+
+          <p>投影时，所有 <code>context_edit</code> 先按 <code>targetId</code> 建索引，再在生成消息时应用。<strong>只允许替换 content</strong>，不能改角色、toolCallId、时间戳等元数据——这保证工具调用与结果仍然配对，也保证审计信息不被篡改。</p>
+
+          <p><code>replacement: null</code> 是“从模型上下文里省略”，不是“删除记录”。重试恢复正是用它把失败尝试及其工具结果成对隐藏，避免孤儿 toolResult 让下一次请求报错。</p>
+
+          <h3>分支摘要</h3>
+          <p>在会话树里跳到一个旧节点继续，原路径的上下文会从模型视野里消失。若那段工作很重要，可以在切分支时生成 <code>branch_summary</code>：它记录“从哪个节点来（<code>fromId</code>）”和摘要文本，投影成一条消息，让新分支知道旧分支做过什么。</p>
+
+          <p>这与压缩的差别是：压缩替换<strong>当前路径的前缀</strong>；分支摘要保留<strong>另一条路径的要点</strong>。两者可以同时存在。</p>
+
+          <h2 id="demo"><span class="h2-num">5.6</span>点一点这棵树</h2>
+          <p>下面是一个真实形状的会话树。点击节点切换 <code>leafId</code>，观察“active branch”如何变化。橙色路径是压缩摘要分支，青色是原始继续。</p>
+
+          <div class="demo" data-demo="tree">
+            <div class="demo-head">
+              <span class="title">session.jsonl · 分支导航</span>
+              <span class="pill teal">append-only</span>
+            </div>
+            <div class="demo-body">
+              <svg class="tree-svg" viewBox="0 0 720 300" role="img" aria-label="会话树">
+                <defs>
+                  <marker id="t5" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <path class="tl" data-to="u1" d="M80 40 V70" marker-end="url(#t5)"></path>
+                <path class="tl" data-to="a1" d="M80 104 V134" marker-end="url(#t5)"></path>
+                <path class="tl" data-to="t1" d="M80 168 V198" marker-end="url(#t5)"></path>
+                <path class="tl" data-to="u2" d="M80 168 V275 H120" marker-end="url(#t5)"></path>
+                <path class="tl" data-to="a2" d="M224 275 H292" marker-end="url(#t5)"></path>
+                <path class="tl" data-to="t2" d="M326 275 H394" marker-end="url(#t5)"></path>
+                <path class="tl" data-to="a3" d="M428 275 H496" marker-end="url(#t5)"></path>
+
+                <path class="tl" data-to="c1" d="M134 151 H490 V40" marker-end="url(#t5)"></path>
+                <path class="tl" data-to="a4" d="M490 40 V70" marker-end="url(#t5)"></path>
+
+                <rect class="tn" data-id="u1" x="26" y="6" width="108" height="34"></rect>
+                <text class="dg-sub" x="36" y="27">u1 · 用户</text>
+
+                <rect class="tn" data-id="a1" x="26" y="70" width="108" height="34"></rect>
+                <text class="dg-sub" x="36" y="91">a1 · assistant</text>
+
+                <rect class="tn" data-id="t1" x="26" y="134" width="108" height="34"></rect>
+                <text class="dg-sub" x="36" y="155">t1 · toolResult</text>
+
+                <rect class="tn" data-id="u2" x="120" y="258" width="90" height="34"></rect>
+                <text class="dg-sub" x="130" y="279">u2 · 用户</text>
+
+                <rect class="tn" data-id="a2" x="224" y="258" width="68" height="34"></rect>
+                <text class="dg-sub" x="234" y="279">a2</text>
+
+                <rect class="tn" data-id="t2" x="326" y="258" width="68" height="34"></rect>
+                <text class="dg-sub" x="336" y="279">t2</text>
+
+                <rect class="tn" data-id="a3" x="428" y="258" width="68" height="34"></rect>
+                <text class="dg-sub" x="438" y="279">a3</text>
+
+                <rect class="tn" data-id="c1" x="400" y="6" width="180" height="34"></rect>
+                <text class="dg-sub" x="412" y="27">c1 · compaction summary</text>
+
+                <rect class="tn" data-id="a4" x="400" y="70" width="180" height="34"></rect>
+                <text class="dg-sub" x="412" y="91">a4 · 基于摘要继续</text>
+
+                <text class="dg-sub" x="600" y="26">click a node →</text>
+                <text class="dg-sub" x="600" y="42">leafId moves</text>
+              </svg>
+              <div class="tree-detail" style="margin-top:14px;font-family:var(--mono);font-size:10px;line-height:1.9;color:var(--ink-2)"></div>
+              <div class="demo-note">注意：c1 是 t1 的另一个子节点。原始路径继续到 a3，摘要路径从 c1 到 a4；两者共享 u1→a1→t1。</div>
+            </div>
+          </div>
+
+          <h2 id="persistence"><span class="h2-num">5.7</span>落盘、加载与迁移</h2>
+          <p>写入是同步的：<code>appendFileSync(sessionFile, JSON.stringify(entry) + "\n")</code>。对单进程 CLI 来说，这比异步队列简单可靠；代价是每次写会阻塞事件循环几毫秒。pi 的应对是<strong>只在消息边界写</strong>，不按 token 写。</p>
+          <ul>
+            <li><strong>加载</strong>：按 1MB 缓冲区流式读取，逐行 <code>JSON.parse</code>；坏行跳过而不是整个文件失败。</li>
+            <li><strong>迁移</strong>：v1 的线性会话自动转成树；v2 到 v3 主要是角色重命名（<code>hookMessage</code> → <code>custom</code>）。</li>
+            <li><strong>压缩时</strong>：先记录 <code>systemMessage</code> 检查点（当前系统提示的完整快照），这样即使压缩跨过提示变更点，重放也能得到正确提示。</li>
+            <li><strong>并发</strong>：同一条会话不应被两个进程同时写。pi 没有文件锁；它假设一个会话同时只有一个活跃的 harness。</li>
+          </ul>
+
+          <div class="callout warn">
+            <div class="callout-title">“不可变”不等于“不可改”</div>
+            <p>文件是追加写的，但你可以用 <code>context_edit</code> 改模型视图，用 <code>label</code> 改显示，用 <code>session_info</code> 改名。真正的原始消息内容永远保留——除非你手动编辑文件。做取证/审计时，应以原始 entry 为准，而不是投影。</p>
+          </div>
+
+          <h2 id="critique"><span class="h2-num">5.8</span>设计评价</h2>
+          <p>这套模型的优雅之处在于<strong>把“历史”与“视图”彻底分开</strong>：</p>
+          <ul>
+            <li>分支不需要复制文件，压缩不需要重写文件，编辑不需要破坏配对。</li>
+            <li>任何时刻都可以重建模型上下文：给定文件与 leafId，投影是纯函数。</li>
+            <li>调试时可以对照“模型看到了什么”和“实际发生了什么”，两者都有据可查。</li>
+          </ul>
+          <p>代价是概念负担：读源码时必须同时跟踪 entry 树、leaf 指针、投影、压缩边界、context edit 五层。尤其 <code>buildContextEntries</code> 里“保留区间中的 system 消息被跳过”这种规则，不读注释很难推断。pi 用文档和类型把这些规则显式化，这是它作为教学样本的另一个优点。</p>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>切分支为什么不需要复制任何 entry？</li>
+              <li>压缩后，被摘要的消息还在文件里吗？模型还能看到吗？</li>
+              <li><code>context_edit</code> 为什么只能替换 content，不能替换 role 或 toolCallId？</li>
+              <li>加载一个父节点缺失的 entry 时会发生什么？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：工具设计与运行接口</span>
+            <span>Figures 5-1 · 2 live demos</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

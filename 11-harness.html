@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Harness 设计 — pi 源码之旅</title>
+<meta name="description" content="harness 的职责边界、设计空间与 pi 的取舍：最小核心、扩展、会话树、压缩、权限与容器化。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">Harness 设计</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 11 · design</div>
+            <h1>模型之外的一切，<br>才是你的产品</h1>
+            <p class="lead">同一个模型，放进不同的 harness，表现可以差一个数量级。工具怎么描述、上下文怎么裁剪、失败怎么恢复、人怎么介入——这些工程决策决定了 agent 是否真的可用。这一章讨论设计空间，以及 pi 为什么选了现在这条路。</p>
+            <div class="meta-row">
+              <span>阅读约 30 分钟</span>
+              <span>设计取舍</span>
+              <span>含安全边界</span>
+            </div>
+          </header>
+
+          <h2 id="definition"><span class="h2-num">11.1</span>Harness 到底是什么</h2>
+          <p>把 LLM 本身看作 CPU：它只会根据输入预测输出。Harness 是围绕它的一整套运行时：</p>
+          <ul>
+            <li><strong>循环</strong>：什么时候再请求一次，什么时候停。</li>
+            <li><strong>工具</strong>：提供哪些能力、如何描述、如何执行、结果如何裁剪。</li>
+            <li><strong>上下文</strong>：系统提示、历史、压缩、检索、分支。</li>
+            <li><strong>接口</strong>：终端、JSON、RPC、SDK；人如何看到进度、如何打断。</li>
+            <li><strong>持久化</strong>：会话如何保存、恢复、分叉、审计。</li>
+            <li><strong>扩展</strong>：第三方如何加工具、改行为、接外部系统。</li>
+            <li><strong>安全</strong>：谁能执行什么，边界在哪里。</li>
+          </ul>
+          <p>一个残酷的事实：<strong>模型能力越强，harness 的瓶颈越明显</strong>。模型已经会写代码，但如果工具返回一万行日志、压缩把关键约束丢了、中断后无法恢复，它依然做不完任务。</p>
+
+          <h2 id="layers"><span class="h2-num">11.2</span>职责分层：pi 的答案</h2>
+
+          <div class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 330" role="img" aria-label="pi harness 的职责分层">
+                <defs>
+                  <marker id="h11" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <rect class="dg-box-accent" x="20" y="20" width="470" height="52"></rect>
+                <text class="dg-label" x="34" y="43">接口层</text>
+                <text class="dg-sub" x="34" y="60">interactive · print · json · rpc · SDK</text>
+
+                <rect class="dg-box-teal" x="20" y="88" width="470" height="66"></rect>
+                <text class="dg-label" x="34" y="111">AgentSession</text>
+                <text class="dg-sub" x="34" y="128">prompt 管线 · 投影 · 压缩 · 重试 · 扩展钩子</text>
+                <text class="dg-sub" x="34" y="143">会话树 · 分支 · 系统提示组装</text>
+
+                <rect class="dg-box" x="20" y="170" width="470" height="60"></rect>
+                <text class="dg-label" x="34" y="193">Agent loop</text>
+                <text class="dg-sub" x="34" y="210">turn 边界 · 工具批次 · 并行/顺序 · steering</text>
+                <text class="dg-sub" x="34" y="225">prepareRequest / finishTurn / 队列</text>
+
+                <rect class="dg-box" x="20" y="246" width="470" height="60"></rect>
+                <text class="dg-label" x="34" y="269">pi-ai</text>
+                <text class="dg-sub" x="34" y="286">事件流 · provider 适配 · 重试 · 用量与成本</text>
+                <text class="dg-sub" x="34" y="301">normalizeContext · 流式 JSON</text>
+
+                <rect class="dg-box" x="530" y="20" width="210" height="52"></rect>
+                <text class="dg-label" x="544" y="43">Extensions</text>
+                <text class="dg-sub" x="544" y="60">工具 / 命令 / 钩子 / UI</text>
+
+                <rect class="dg-box" x="530" y="88" width="210" height="66"></rect>
+                <text class="dg-label" x="544" y="111">Session store</text>
+                <text class="dg-sub" x="544" y="128">append-only JSONL</text>
+                <text class="dg-sub" x="544" y="143">id / parentId / leafId</text>
+
+                <rect class="dg-box" x="530" y="170" width="210" height="60"></rect>
+                <text class="dg-label" x="544" y="193">Tools</text>
+                <text class="dg-sub" x="544" y="210">read / edit / bash / …</text>
+                <text class="dg-sub" x="544" y="225">截断 · 变更队列</text>
+
+                <rect class="dg-box-ochre" x="530" y="246" width="210" height="60"></rect>
+                <text class="dg-label" x="544" y="269">Model providers</text>
+                <text class="dg-sub" x="544" y="286">HTTP / SSE</text>
+                <text class="dg-sub" x="544" y="301">无状态</text>
+
+                <path class="dg-line" d="M255 72 V88" marker-end="url(#h11)"></path>
+                <path class="dg-line" d="M255 154 V170" marker-end="url(#h11)"></path>
+                <path class="dg-line" d="M255 230 V246" marker-end="url(#h11)"></path>
+                <path class="dg-line" d="M490 121 H530" marker-end="url(#h11)"></path>
+                <path class="dg-line" d="M490 200 H530" marker-end="url(#h11)"></path>
+                <path class="dg-line" d="M490 276 H530" marker-end="url(#h11)"></path>
+                <path class="dg-line" d="M635 72 V88" marker-end="url(#h11)"></path>
+                <path class="dg-line" d="M635 154 V170" marker-end="url(#h11)"></path>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 11-1</b> 上层只依赖下层的窄接口；扩展与会话存储从侧面接入。模型永远在最底部，是唯一“不可控”的依赖。</figcaption>
+          </div>
+
+          <p>这个分层最重要的性质是<strong>可替换</strong>：</p>
+          <ul>
+            <li>换 provider，不动 loop；</li>
+            <li>换 UI，不动 session；</li>
+            <li>加工具，不动核心；</li>
+            <li>换存储，不动循环（只要实现同样的会话接口）。</li>
+          </ul>
+          <p>pi 没有把所有东西塞进一个大 <code>Agent</code> 类，而是让 <code>AgentSession</code> 组合 <code>Agent</code>、<code>SessionManager</code>、<code>Settings</code>、<code>ExtensionRunner</code>。组合比继承更容易替换，也更容易测试。</p>
+
+          <h2 id="contract"><span class="h2-num">11.3</span>把契约写进类型：<code>AgentLoopConfig</code></h2>
+          <p>loop 不直接依赖 session，而是依赖一组回调。这个接口就是 harness 的“插座”：</p>
+
+          <div class="code-panel" data-file="packages/agent/src/types.ts" data-lang="ts" data-start="193" data-highlight="2,11-13,52,72">
+            <div class="code-head">
+              <span class="path">packages/agent/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export interface AgentLoopConfig extends SimpleStreamOptions {
+	model: Model<any>;
+
+	/**
+	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
+	 *
+	 * Each AgentMessage must be converted to a SystemMessage, UserMessage, AssistantMessage, or ToolResultMessage
+	 * that the LLM can understand. AgentMessages that cannot be converted (e.g., UI-only notifications,
+	 * status messages) should be filtered out.
+	 *
+	 * Contract: must not throw or reject. Return a safe fallback value instead.
+	 * Throwing interrupts the low-level agent loop without producing a normal event sequence.
+	 *
+	 * @example
+	 * ```typescript
+	 * convertToLlm: (messages) => messages.flatMap(m => {
+	 *   if (m.role === "custom") {
+	 *     // Convert custom message to user message
+	 *     return [{ role: "user", content: m.content, timestamp: m.timestamp }];
+	 *   }
+	 *   if (m.role === "notification") {
+	 *     // Filter out UI-only messages
+	 *     return [];
+	 *   }
+	 *   // Pass through standard LLM messages
+	 *   return [m];
+	 * })
+	 * ```
+	 */
+	convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+
+	/**
+	 * Optional transform applied to the context before `convertToLlm`.
+	 *
+	 * Use this for operations that work at the AgentMessage level:
+	 * - Context window management (pruning old messages)
+	 * - Injecting context from external sources
+	 *
+	 * Contract: must not throw or reject. Return the original messages or another
+	 * safe fallback value instead.
+	 *
+	 * @example
+	 * ```typescript
+	 * transformContext: async (messages) => {
+	 *   if (estimateTokens(messages) > MAX_TOKENS) {
+	 *     return pruneOldMessages(messages);
+	 *   }
+	 *   return messages;
+	 * }
+	 * ```
+	 */
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+
+	/**
+	 * Resolves an API key dynamically for each LLM call.
+	 *
+	 * Useful for short-lived OAuth tokens (e.g., GitHub Copilot) that may expire
+	 * during long-running tool execution phases.
+	 *
+	 * Contract: must not throw or reject. Return undefined when no key is available.
+	 */
+	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+
+	/**
+	 * Called after the assistant message and all tool-result messages have been emitted, immediately before `turn_end`.
+	 * `{ action: "end" }` ends the run without polling queues or preparing another request.
+	 * On a normal turn, `{ action: "continue" }` ensures one next provider request. Tool-result, steering, or
+	 * follow-up scheduling can satisfy that request and adds no extra request; otherwise the loop continues once
+	 * with the current context. Returning undefined preserves normal scheduling. Error and aborted responses remain
+	 * hard exits.
+	 */
+	finishTurn?: FinishTurn;
+            </script>
+            <ul class="code-notes">
+              <li><b>L194</b><span>loop 需要一个模型，但不关心它是哪家。provider 差异在 <code>pi-ai</code> 内部消化。</span></li>
+              <li><b>L203</b><span><strong>“不得抛异常”</strong>被写进契约。转换函数一旦抛错，loop 会产生不完整的事件序列，UI 与持久化都会错位。失败要返回安全回退值。</span></li>
+              <li><b>L236-244</b><span><code>transformContext</code> 是上下文管理的入口：裁剪、注入、检索都在这里，且发生在转换之前。</span></li>
+              <li><b>L258-264</b><span><code>finishTurn</code> 把“是否继续”的决策交给上层。loop 提供机制，session 决定策略（例如重试、压缩后继续、或直接结束）。</span></li>
+            </ul>
+          </div>
+
+          <p>注意这些回调的<strong>失败语义</strong>：除了 <code>finishTurn</code> 这类显式控制点，大多数钩子被设计成“可失败但不致命”。扩展的 <code>tool_call</code> 处理器是例外——它决定工具是否执行，出错时选择 fail closed（见第 07 章）。</p>
+
+          <h2 id="choices"><span class="h2-num">11.4</span>设计空间：pi 的取舍</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>维度</th><th>pi 的选择</th><th>替代方案</th><th>代价 / 收益</th></tr></thead>
+              <tbody>
+                <tr><td>产品形态</td><td>最小核心 + 扩展</td><td>大而全的固定工作流</td><td>上手简单、可定制；但需要用户自己拼能力。</td></tr>
+                <tr><td>子 agent</td><td>不内置</td><td>内置 planner/executor/reviewer</td><td>核心简单、上下文可控；复杂任务要自己扩展。</td></tr>
+                <tr><td>计划模式</td><td>不内置</td><td>独立的 plan/act 两阶段</td><td>避免“计划漂移”；但少了强制审查点。</td></tr>
+                <tr><td>权限</td><td>无内置沙箱</td><td>细粒度 allow/deny + 审批</td><td>信任用户环境；安全需靠容器化。</td></tr>
+                <tr><td>会话</td><td>append-only 树</td><td>可变数据库行</td><td>分支/审计/恢复强；存储会增长。</td></tr>
+                <tr><td>扩展加载</td><td>同进程 jiti</td><td>独立进程 + RPC</td><td>零序列化开销；扩展拥有完整权限。</td></tr>
+                <tr><td>UI</td><td>自研差分 TUI</td><td>Web / Electron</td><td>轻、SSH 友好；复杂交互受限。</td></tr>
+                <tr><td>工具执行</td><td>默认并行，可标顺序</td><td>全部串行</td><td>快；但需要处理竞态与顺序依赖。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这些选择不是“对/错”，而是<strong>把复杂度放在哪里</strong>。pi 把复杂度推到扩展作者和容器边界，换取核心的可读性与可替换性。对个人开发者，这是友好的；对需要强合规的团队，则需要在外围补齐审批与隔离。</p>
+
+          <h2 id="context"><span class="h2-num">11.5</span>上下文管理：harness 的核心竞争力</h2>
+          <p>同一个模型，上下文组织得好不好，任务完成率差别巨大。pi 的做法可以概括为四层：</p>
+          <ol>
+            <li><strong>系统提示分段</strong>：基础行为、工具说明、项目上下文、技能、动态提醒，各自独立成段，便于 diff 与缓存。</li>
+            <li><strong>工具结果截断</strong>：read 默认最多 2000 行 / 50KB；bash 输出同样有上限，并提示模型“结果被截断”。</li>
+            <li><strong>压缩</strong>：接近窗口上限时，把旧历史替换成摘要 + 最近保留区，原始记录仍在 JSONL 中。</li>
+            <li><strong>分支与投影</strong>：会话是树，当前上下文只是从根到叶的一条路径；切换分支不需要重写历史。</li>
+          </ol>
+          <p>第 05 章详细讲了投影算法。这里强调一个设计原则：<strong>压缩不是删除</strong>。原始消息永远保留，摘要只是“当前视图”的一部分。这让用户可以在压缩后回溯、分叉、甚至手动编辑上下文。</p>
+
+          <h2 id="failure"><span class="h2-num">11.6</span>失败处理：agent 的日常</h2>
+          <p>在 agent 里，失败是常态而非异常。一个成熟 harness 至少要处理：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>失败</th><th>表现</th><th>pi 的处理</th></tr></thead>
+              <tbody>
+                <tr><td>网络/限流</td><td>请求报错、429</td><td><code>pi-ai</code> 按 provider 策略重试；可重试错误带退避。</td></tr>
+                <tr><td>流中断</td><td>已收到部分文本</td><td>产生 error 消息；上层决定重试还是保留部分结果。</td></tr>
+                <tr><td>工具报错</td><td>命令非零退出、文件不存在</td><td>转成 <code>isError: true</code> 的 toolResult，让模型自己修正。</td></tr>
+                <tr><td>参数不合法</td><td>JSON 不符合 schema</td><td>校验失败，返回结构化错误，不执行副作用。</td></tr>
+                <tr><td>输出截断</td><td><code>stopReason === "length"</code></td><td>该批次所有工具调用判为失败，避免执行半截参数。</td></tr>
+                <tr><td>上下文溢出</td><td>provider 报超窗</td><td>触发压缩/裁剪，必要时丢弃最旧轮次。</td></tr>
+                <tr><td>用户中止</td><td>Ctrl-C / abort</td><td><code>AbortSignal</code> 贯穿请求与工具；产生 aborted 消息。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>一个容易忽略的点：<strong>工具错误要返回给模型，而不是抛给用户</strong>。模型看到“文件不存在”，会自己换路径；用户看到红色堆栈，只会困惑。pi 的 <code>createErrorToolResult()</code> 就是把这类失败转成模型可读的文本。</p>
+
+          <h2 id="security"><span class="h2-num">11.7</span>安全边界：信任模型，还是信任沙箱</h2>
+          <p>这是 harness 设计里最容易被低估的部分。pi 的 README 写得很直接：</p>
+          <blockquote>
+            <p>Pi does not include a built-in permission system for restricting filesystem, process, network, or credential access. By default, it runs with the permissions of the user and process that launched it.</p>
+            <p>If you need stronger boundaries, containerize or sandbox Pi.</p>
+          </blockquote>
+          <p>换句话说：<strong>安全边界不在 agent 内部，而在进程/容器边界</strong>。这有两种完全不同的哲学：</p>
+          <ul>
+            <li><strong>审批式</strong>：每个危险操作弹窗，用户点“允许”。优点是细粒度；缺点是打断心流，且用户会习惯性点允许。</li>
+            <li><strong>隔离式</strong>：agent 在容器/虚拟机里随便跑，边界由内核保证。优点是无需打断；缺点是需要基础设施。</li>
+          </ul>
+          <p>pi 选择后者，并提供三种容器化模式（见 <code>docs/containerization.md</code>）：</p>
+          <ol>
+            <li><strong>Gondolin 扩展</strong>：pi 与 provider 凭证留在宿主机，内置工具和 <code>!</code> 命令路由进本地 Linux micro-VM。</li>
+            <li><strong>纯 Docker</strong>：整个 pi 进程跑在容器里，简单直接。</li>
+            <li><strong>OpenShell</strong>：在策略控制的沙箱中运行，适合企业环境。</li>
+          </ol>
+          <div class="callout warn">
+            <div class="callout-title">扩展 = 任意代码执行</div>
+            <p>pi 的扩展在同一进程内加载，拥有与 pi 相同的权限。安装第三方扩展等同于运行一个 npm 包。第 07 章讲过 <code>jiti</code> 的加载机制；它能加载 TypeScript，但<strong>不是沙箱</strong>。不要把“扩展”误认为“受限插件”。</p>
+          </div>
+
+          <h2 id="extension"><span class="h2-num">11.8</span>可扩展性的阶梯</h2>
+          <p>pi 把定制分成几个层级，复杂度递增：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层级</th><th>能做什么</th><th>不改代码</th><th>适合</th></tr></thead>
+              <tbody>
+                <tr><td>Prompt template</td><td>预置一段提示词/参数</td><td>是</td><td>重复性任务、团队规范。</td></tr>
+                <tr><td>Skill</td><td>按需加载的说明与脚本</td><td>是</td><td>领域知识、操作手册。</td></tr>
+                <tr><td>Extension</td><td>加工具、命令、钩子、UI</td><td>是</td><td>接内部系统、改工具行为。</td></tr>
+                <tr><td>Package</td><td>把以上打包分发</td><td>是</td><td>团队共享、npm 发布。</td></tr>
+                <tr><td>Fork / SDK</td><td>改核心、嵌入自有产品</td><td>否</td><td>深度定制、产品集成。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这个阶梯的好处是<strong>升级路径清晰</strong>：先写提示词，不够再写 skill，再不够写扩展，最后才 fork。大多数人停在前两层，核心因此能保持稳定。</p>
+
+          <h2 id="minimal"><span class="h2-num">11.9</span>“不做什么”也是设计</h2>
+          <p>pi 明确不内置 sub-agents 和 plan mode。这不是能力缺失，而是对复杂度的控制：</p>
+          <ul>
+            <li><strong>Sub-agents</strong>：需要额外的上下文隔离、结果汇总、生命周期管理；做不好会变成“多个模型互相污染上下文”。</li>
+            <li><strong>Plan mode</strong>：强制两阶段会降低简单任务的效率；而“计划”本身很难在不执行的情况下验证。</li>
+          </ul>
+          <p>替代方案是：让用户用扩展实现自己想要的形态。这符合 pi 的定位——<strong>不是替你决定工作流，而是给你拼装工作流的零件</strong>。代价是初次使用需要更多判断；收益是不会被框架的假设锁死。</p>
+
+          <h2 id="critique"><span class="h2-num">11.10</span>评价：什么时候该用 pi</h2>
+          <p>pi 适合：</p>
+          <ul>
+            <li>想要一个可读、可改、无 magic 的 coding agent 核心；</li>
+            <li>愿意自己写扩展来适配工作流；</li>
+            <li>能接受“安全靠容器化”的运维前提；</li>
+            <li>重视会话可恢复、可分支、可审计。</li>
+          </ul>
+          <p>不太适合：</p>
+          <ul>
+            <li>需要开箱即用的企业审批流与细粒度权限；</li>
+            <li>需要内置的多 agent 编排与可视化工作流编辑器；</li>
+            <li>团队完全没有 Node/TypeScript 维护能力。</li>
+          </ul>
+          <p>设计 harness 时，最值得抄的不是某个具体实现，而是它的<strong>分层与契约</strong>：把模型调用、循环、工具、上下文、接口分开；把“不得抛异常”“失败要可恢复”“原始记录不可变”写成明确规则。这些规则比任何 prompt 技巧都更影响长期可用性。</p>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>为什么 <code>convertToLlm</code> 的契约要求“不得抛异常”？抛了会破坏什么？</li>
+              <li>压缩为什么不能直接删除原始消息？</li>
+              <li>“审批式”和“隔离式”安全边界各适合什么场景？</li>
+              <li>pi 不内置 sub-agents/plan mode，换来了什么？失去了什么？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：动手实践</span>
+            <span>design tradeoffs</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

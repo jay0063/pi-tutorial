@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Agent Loop 深潜 — pi 源码之旅</title>
+<meta name="description" content="pi-agent-core 的双层循环、工具流水线、并行批处理、steering 与 follow-up 的精确语义。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">Agent Loop 深潜</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 03 · pi-agent-core</div>
+            <h1>一个循环，<br>三种“继续”的理由</h1>
+            <p class="lead">agent loop 的全部难点不在“调用模型”，而在<strong>什么时候再调用一次</strong>。pi 用双层 <code>while</code>、两个队列和三个钩子，把“有工具结果”“用户插话”“用户追加任务”这三种继续理由分得清清楚楚。</p>
+            <div class="meta-row">
+              <span>阅读约 35 分钟</span>
+              <span>关键文件 2 个</span>
+              <span>含交互动画</span>
+            </div>
+          </header>
+
+          <h2 id="vocab"><span class="h2-num">3.1</span>先把三个词钉死</h2>
+          <p>读循环之前，必须区分三个时间尺度。pi 的类型注释里写得很明确：</p>
+
+          <div class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 190" role="img" aria-label="agent、turn、message 的层级关系">
+                <rect class="dg-box" x="20" y="24" width="720" height="142" rx="4"></rect>
+                <text class="dg-label" x="34" y="46">run / agent（一次 prompt 到 agent_end）</text>
+
+                <rect class="dg-box-teal" x="40" y="62" width="300" height="86"></rect>
+                <text class="dg-sub" x="52" y="80">turn 1</text>
+                <rect class="dg-box" x="58" y="90" width="120" height="42"></rect>
+                <text class="dg-sub" x="68" y="106">assistant msg</text>
+                <text class="dg-sub" x="68" y="120">+ tool calls</text>
+                <rect class="dg-box" x="196" y="90" width="124" height="42"></rect>
+                <text class="dg-sub" x="206" y="106">tool results</text>
+                <text class="dg-sub" x="206" y="120">（按源顺序）</text>
+
+                <rect class="dg-box-teal" x="380" y="62" width="300" height="86"></rect>
+                <text class="dg-sub" x="392" y="80">turn 2</text>
+                <rect class="dg-box" x="398" y="90" width="120" height="42"></rect>
+                <text class="dg-sub" x="408" y="106">assistant msg</text>
+                <text class="dg-sub" x="408" y="120">（无工具调用）</text>
+                <rect class="dg-box-ochre" x="536" y="90" width="124" height="42"></rect>
+                <text class="dg-sub" x="546" y="106">finishTurn</text>
+                <text class="dg-sub" x="546" y="120">→ end / continue</text>
+
+                <path class="dg-line" d="M340 105 H380" marker-end="url(#a3)"></path>
+                <defs>
+                  <marker id="a3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 3-1</b> 一个 run 包含多个 turn；一个 turn = 一次 assistant 响应 + 它触发的工具结果。工具执行属于产生它的那个 turn。</figcaption>
+          </div>
+
+          <p>事件顺序对应如下。注意 <code>message_start/end</code> 对每条消息都发，而 <code>message_update</code> 只在 assistant 流式期间发，且携带原始的 <code>AssistantMessageEvent</code>：</p>
+
+          <pre class="plain-tree">agent_start
+└─ turn_start
+   ├─ message_start   (user / steering / follow-up)
+   ├─ message_end
+   ├─ message_start   (assistant)
+   ├─ message_update  ← text_delta / toolcall_delta / ...
+   ├─ message_end
+   ├─ tool_execution_start
+   ├─ tool_execution_update   (可选，多次)
+   ├─ tool_execution_end
+   ├─ message_start   (toolResult)
+   └─ message_end
+└─ turn_end
+agent_end</pre>
+
+          <div class="callout tip">
+            <div class="callout-title">为什么 agent_end 也带 messages</div>
+            <p><code>agent_end</code> 携带整个 run 新增的消息数组。这样订阅者可以在一个事件里完成落盘，而不必自己维护增量。这个数组也是 <code>EventStream&lt;AgentEvent, AgentMessage[]&gt;</code> 的最终结果。</p>
+          </div>
+
+          <h2 id="loops"><span class="h2-num">3.2</span>双层循环：内层处理工作，外层处理“再来一轮”</h2>
+          <p><code>runLoop()</code> 是 <code>agentLoop()</code> 与 <code>agentLoopContinue()</code> 的共同实现。它只有两个循环，但职责划分非常精确。</p>
+
+          <div class="code-panel" data-file="packages/agent/src/agent-loop.ts" data-lang="ts" data-start="187" data-highlight="2,6,8-15,30-31">
+            <div class="code-head">
+              <span class="path">packages/agent/src/agent-loop.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	// Outer loop: continues when queued follow-up messages arrive after agent would stop
+	while (true) {
+		let hasMoreToolCalls = true;
+
+		// Inner loop: process tool calls and steering messages
+		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			let preparedMessages: AgentMessage[] = [];
+			if (lastCompletedTurn) {
+				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+				if (nextTurnSnapshot) {
+					currentContext = nextTurnSnapshot.context ?? currentContext;
+					preparedMessages = nextTurnSnapshot.messages ?? [];
+					config = {
+						...config,
+						model: nextTurnSnapshot.model ?? config.model,
+						reasoning:
+							nextTurnSnapshot.thinkingLevel === undefined
+								? config.reasoning
+								: nextTurnSnapshot.thinkingLevel === "off"
+									? undefined
+									: nextTurnSnapshot.thinkingLevel,
+					};
+				}
+				// Preparation can be long-running (for example, compaction). Pick up steering
+				// queued while it ran. Only poll again if the earlier poll returned nothing;
+				// otherwise one-at-a-time mode would deliver two messages in this turn.
+				if (pendingMessages.length === 0) {
+					pendingMessages = (await config.getSteeringMessages?.()) || [];
+				}
+				await emit({ type: "turn_start" });
+			}
+            </script>
+            <ul class="code-notes">
+              <li><b>L188</b><span><strong>外层只为 follow-up 存在</strong>。内层退出意味着“没有工具、没有 steering”，此时才检查 follow-up 队列；有就塞回 <code>pendingMessages</code> 并 <code>continue</code>。</span></li>
+              <li><b>L192</b><span><strong>内层条件是两个布尔量</strong>：还有工具调用，或还有待注入消息。初始 <code>hasMoreToolCalls = true</code>，所以第一次一定进入。</span></li>
+              <li><b>L195</b><span><code>prepareNextTurn</code> 是产品层插入的钩子（压缩、模型切换、上下文重建都在这里）。它可以替换 <code>context</code> 并附加系统消息。</span></li>
+              <li><b>L210-215</b><span>一句注释揭示了一个真实 bug 的修复：准备过程可能很久（压缩），期间用户可能插话。只在先前没有拿到 steering 时才再轮询，否则 one-at-a-time 模式会一次交付两条。</span></li>
+            </ul>
+          </div>
+
+          <p>一次迭代的主体是“准备 → 请求 → 流式响应 → 工具 → 终结”。终结部分决定了循环是否继续：</p>
+
+          <div class="code-panel" data-file="packages/agent/src/agent-loop.ts" data-lang="ts" data-start="289" data-highlight="7-11,13-20,26-31,34-38">
+            <div class="code-head">
+              <span class="path">packages/agent/src/agent-loop.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+			lastCompletedTurn = {
+				message,
+				toolResults,
+				context: currentContext,
+				newMessages,
+			};
+			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
+			await emit({ type: "turn_end", message, toolResults });
+
+			if (decision?.action === "end") {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			explicitContinuation = decision?.action === "continue";
+			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (hasMoreToolCalls || pendingMessages.length > 0) {
+				explicitContinuation = false;
+			}
+		}
+
+		// Agent would stop here. Check for follow-up messages.
+		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		if (followUpMessages.length > 0) {
+			// Set as pending so inner loop processes them
+			explicitContinuation = false;
+			pendingMessages = followUpMessages;
+			continue;
+		}
+
+		// No natural request was selected, so fulfill the continuation decision with one context-only turn.
+		if (explicitContinuation) {
+			explicitContinuation = false;
+			continue;
+		}
+
+		// No more messages, exit
+		break;
+            </script>
+            <ul class="code-notes">
+              <li><b>L295</b><span><code>finishTurn</code> 在 <code>turn_end</code> <strong>之前</strong>运行，但它的决策在 <code>turn_end</code> 之后才生效。这样订阅者看到的 <code>turn_end</code> 仍是完整的一轮。</span></li>
+              <li><b>L298</b><span><code>end</code> 是硬退出：不轮询 steering，也不轮询 follow-up。适合“预算耗尽”“检测到终止条件”等场景。</span></li>
+              <li><b>L303-307</b><span><code>continue</code> 只是“希望再请求一次”；如果工具或 steering 已经保证了这一点，就把显式意图清掉，避免多跑一轮空请求。</span></li>
+              <li><b>L311</b><span>follow-up 只在 agent 本来就要停时检查。<strong>它不是插话</strong>，语义是“你干完之后再做这个”。</span></li>
+            </ul>
+          </div>
+
+          <h3>硬退出：错误与中断</h3>
+          <p>如果 assistant 消息的 <code>stopReason</code> 是 <code>error</code> 或 <code>aborted</code>，循环会走另一条路径：调用一次 <code>finishTurn</code>（其决策被忽略）、发 <code>turn_end</code> 与 <code>agent_end</code>、立即返回。这是刻意的：错误不能被 follow-up 队列悄悄“续命”，否则会无限重试。</p>
+
+          <h2 id="pipeline"><span class="h2-num">3.3</span>工具调用流水线</h2>
+          <p>一次工具调用要穿过六个阶段。把“查找工具、解析参数、校验 schema、权限钩子”都放在执行之前，意味着<strong>被拒绝的调用也会得到一条结构化的 toolResult</strong>，模型能看见原因并修正。</p>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 250" role="img" aria-label="工具调用流水线">
+                <defs>
+                  <marker id="p3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <rect class="dg-box" x="16" y="52" width="104" height="52"></rect>
+                <text class="dg-label" x="30" y="74">toolCall</text>
+                <text class="dg-sub" x="30" y="90">来自 assistant</text>
+
+                <rect class="dg-box" x="152" y="52" width="112" height="52"></rect>
+                <text class="dg-label" x="166" y="74">lookup</text>
+                <text class="dg-sub" x="166" y="90">按 name 查工具</text>
+
+                <rect class="dg-box" x="296" y="52" width="112" height="52"></rect>
+                <text class="dg-label" x="310" y="74">parse + validate</text>
+                <text class="dg-sub" x="310" y="90">prepareArguments</text>
+
+                <rect class="dg-box-accent" x="440" y="52" width="112" height="52"></rect>
+                <text class="dg-label" x="454" y="74">beforeToolCall</text>
+                <text class="dg-sub" x="454" y="90">可 block / terminate</text>
+
+                <rect class="dg-box-teal" x="584" y="52" width="112" height="52"></rect>
+                <text class="dg-label" x="598" y="74">execute()</text>
+                <text class="dg-sub" x="598" y="90">signal + onUpdate</text>
+
+                <rect class="dg-box" x="440" y="160" width="112" height="52"></rect>
+                <text class="dg-label" x="454" y="182">afterToolCall</text>
+                <text class="dg-sub" x="454" y="198">可改写结果</text>
+
+                <rect class="dg-box" x="296" y="160" width="112" height="52"></rect>
+                <text class="dg-label" x="310" y="182">toolResult msg</text>
+                <text class="dg-sub" x="310" y="198">content + details</text>
+
+                <path class="dg-line" d="M120 78 H152" marker-end="url(#p3)"></path>
+                <path class="dg-line" d="M264 78 H296" marker-end="url(#p3)"></path>
+                <path class="dg-line" d="M408 78 H440" marker-end="url(#p3)"></path>
+                <path class="dg-line" d="M552 78 H584" marker-end="url(#p3)"></path>
+                <path class="dg-line" d="M640 104 V160 H552" marker-end="url(#p3)"></path>
+                <path class="dg-line" d="M440 186 H408" marker-end="url(#p3)"></path>
+
+                <path class="dg-line-dash" d="M198 104 C 198 210 270 210 296 190" marker-end="url(#p3)"></path>
+                <text class="dg-sub" x="118" y="150">not found</text>
+                <path class="dg-line-dash" d="M352 104 C 352 132 330 132 330 160" marker-end="url(#p3)"></path>
+                <text class="dg-sub" x="358" y="128">parse / schema 失败</text>
+                <path class="dg-line-dash" d="M496 104 V160" marker-end="url(#p3)"></path>
+                <text class="dg-sub" x="504" y="136">blocked</text>
+
+                <text class="dg-sub" x="16" y="238">所有失败路径都产生 isError: true 的 toolResult；异常不会击穿循环。</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 3-2</b> 准备阶段的失败是“立即结果”（immediate），不进入 <code>execute()</code>；成功准备后才有执行与后置钩子。</figcaption>
+          </figure>
+
+          <div class="code-panel" data-file="packages/agent/src/agent-loop.ts" data-lang="ts" data-start="726" data-highlight="5-10,12-13,18-32,40-45,53-58">
+            <div class="code-head">
+              <span class="path">packages/agent/src/agent-loop.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	const tool = tools.find((t) => t.name === toolCall.name);
+	if (!tool) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			isError: true,
+		};
+	}
+
+	try {
+		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		if (config.beforeToolCall) {
+			const beforeResult = await config.beforeToolCall(
+				{
+					assistantMessage,
+					toolCall,
+					args: validatedArgs,
+					context: currentContext,
+				},
+				signal,
+			);
+			if (signal?.aborted) {
+				return {
+					kind: "immediate",
+					result: createErrorToolResult("Operation aborted"),
+					isError: true,
+				};
+			}
+			if (beforeResult?.block) {
+				const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
+				if (beforeResult.terminate === true) {
+					result.terminate = true;
+				}
+				return {
+					kind: "immediate",
+					result,
+					isError: true,
+				};
+			}
+		}
+		if (signal?.aborted) {
+			return {
+				kind: "immediate",
+				result: createErrorToolResult("Operation aborted"),
+				isError: true,
+			};
+		}
+		return {
+			kind: "prepared",
+			toolCall,
+			tool,
+			args: validatedArgs,
+		};
+	} catch (error) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+		};
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L726</b><span>查找失败不是抛异常，而是返回一个“立即结果”。这让上层代码只有一条路径：处理结果。</span></li>
+              <li><b>L736</b><span><code>prepareArguments</code> 给工具一个机会修正/规范化原始参数（例如补默认值、解开别名），然后才做 schema 校验。</span></li>
+              <li><b>L738</b><span><code>beforeToolCall</code> 是权限、沙箱、审计的插入点。它拿到的是<strong>已校验</strong>的参数，不需要自己再防御。</span></li>
+              <li><b>L756</b><span>block 的结果可以带 <code>terminate</code>；是否提前结束由整批结果共同决定。</span></li>
+              <li><b>L780</b><span>整个 try/catch 覆盖参数准备与钩子：钩子抛错也会变成模型可见的错误结果，而不是让 run 崩溃。</span></li>
+            </ul>
+          </div>
+
+          <h3>执行：更新、计时与取消</h3>
+          <p><code>executePreparedToolCall()</code> 给工具传三个东西：调用 id、校验后的参数、<code>AbortSignal</code>，以及一个 <code>onUpdate</code> 回调。工具可以多次报告部分结果（例如 bash 的增量输出），循环会把它们转成 <code>tool_execution_update</code>。</p>
+
+          <div class="code-panel" data-file="packages/agent/src/agent-loop.ts" data-lang="ts" data-start="836" data-highlight="1-4,7-15,20-24">
+            <div class="code-head">
+              <span class="path">packages/agent/src/agent-loop.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	const updateEvents: Promise<void>[] = [];
+	let acceptingUpdates = true;
+	const startedAt = performance.now();
+	const elapsed = () => Math.round(performance.now() - startedAt);
+
+	try {
+		const result = await prepared.tool.execute(
+			prepared.toolCall.id,
+			prepared.args as never,
+			signal,
+			(partialResult) => {
+				if (!acceptingUpdates) return;
+				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+			},
+		);
+		const durationMs = elapsed();
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return { result, isError: result.isError === true, durationMs };
+	} catch (error) {
+		const durationMs = elapsed();
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return {
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+			durationMs,
+		};
+	} finally {
+		acceptingUpdates = false;
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L846</b><span><code>performance.now()</code> 是单调时钟，不受系统时间调整影响；<code>durationMs</code> 会进入事件与 toolResult。</span></li>
+              <li><b>L853</b><span>更新回调先收集为 Promise，执行结束后统一 <code>await</code>。这保证 <code>tool_execution_end</code> 不会抢在最后一条 update 之前。</span></li>
+              <li><b>L860</b><span><code>acceptingUpdates = false</code> 是一道闸门：工具在返回后仍异步调用 <code>onUpdate</code> 也不会污染事件流。</span></li>
+              <li><b>L855-863</b><span>工具抛错被规范化为错误结果。注意：<code>AbortSignal</code> 触发时工具通常抛 <code>AbortError</code>，同样落到这里。</span></li>
+            </ul>
+          </div>
+
+          <h3>结果消息：content 给模型，details 给程序</h3>
+          <p><code>createToolResultMessage()</code> 把执行结果转成 transcript 里的消息。这里有一个小而关键的分工：</p>
+          <ul>
+            <li><strong>content</strong>：模型看得见的文本/图片，进入下一次请求的上下文。</li>
+            <li><strong>details</strong>：结构化的完整结果，供 UI 渲染、扩展读取、日志分析，不进入模型上下文。</li>
+            <li><strong>usage</strong>：工具自身消耗的 token/费用（例如子 agent），计入整轮成本。</li>
+          </ul>
+          <p>这样设计避免了“为了 UI 好看而把大 JSON 塞进上下文”的常见浪费。工具作者可以返回丰富的 details，同时只给模型一句摘要。</p>
+
+          <h2 id="parallel"><span class="h2-num">3.4</span>并行执行，但顺序落盘</h2>
+          <p>默认的 <code>toolExecution</code> 是 <code>parallel</code>。但“并行”有三个精确的限定：</p>
+          <ol>
+            <li><strong>预检串行</strong>：每个调用依次执行 <code>prepareToolCall</code>。这样权限钩子看到的顺序是确定的，UI 也能按源顺序显示。</li>
+            <li><strong>只要有一个工具声明 <code>executionMode: "sequential"</code>，整批串行</strong>。这是“批次级”约束，不是“该工具单独串行”。</li>
+            <li><strong>结果按 assistant 源顺序生成消息</strong>，尽管完成事件按实际完成顺序发出。</li>
+          </ol>
+
+          <div class="code-panel" data-file="packages/agent/src/agent-loop.ts" data-lang="ts" data-start="525" data-highlight="3-7">
+            <div class="code-head">
+              <span class="path">packages/agent/src/agent-loop.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
+	const hasSequentialToolCall = toolCalls.some(
+		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
+	);
+	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	}
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+            </script>
+            <ul class="code-notes">
+              <li><b>L525</b><span>只挑出 <code>type: "toolCall"</code> 的块；同一个 assistant 消息里的文本与思考块不参与执行。</span></li>
+              <li><b>L526-528</b><span>“存在任一 sequential 工具”就整批降级。这避免了同一文件被并行读写导致的竞态，代价是牺牲了其他工具的并行度。</span></li>
+              <li><b>L529</b><span>决策是纯函数式的：只看配置与工具声明，不看运行时状态。容易测试，也容易预测。</span></li>
+            </ul>
+          </div>
+
+          <p>并行分支的实现有一个值得注意的技巧：它先同步地做预检，把每个已准备调用包成一个 <strong>thunk</strong>（<code>() =&gt; Promise&lt;Outcome&gt;</code>），立即完成的调用则直接放入结果。最后用 <code>Promise.all</code> 一次性启动所有 thunk。</p>
+
+          <div class="code-panel" data-file="packages/agent/src/agent-loop.ts" data-lang="ts" data-start="629" data-highlight="2-14,18-23,25-31">
+            <div class="code-head">
+              <span class="path">packages/agent/src/agent-loop.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+		finalizedCalls.push(async () => {
+			if (signal?.aborted) {
+				const finalized = {
+					toolCall,
+					result: createErrorToolResult("Operation aborted"),
+					isError: true,
+				} satisfies FinalizedToolCallOutcome;
+				await emitToolExecutionEnd(finalized, emit);
+				return finalized;
+			}
+			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const finalized = await finalizeExecutedToolCall(
+				currentContext,
+				assistantMessage,
+				preparation,
+				executed,
+				config,
+				signal,
+			);
+			await emitToolExecutionEnd(finalized, emit);
+			return finalized;
+		});
+		if (signal?.aborted) {
+			break;
+		}
+	}
+
+	const orderedFinalizedCalls = await Promise.all(
+		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	);
+	const messages: ToolResultMessage[] = [];
+	for (const finalized of orderedFinalizedCalls) {
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L631</b><span>thunk 里再查一次 <code>signal.aborted</code>：预检可能耗时，期间用户可能取消。已取消的调用仍产生一条错误结果，保持“每个 toolCall 都有回应”。</span></li>
+              <li><b>L655</b><span><code>Promise.all</code> 保持数组顺序，即使完成顺序不同。这是“并发执行、顺序收集”的标准写法。</span></li>
+              <li><b>L661</b><span>只有收集完成后才逐条发 <code>toolResult</code> 消息事件。因此 <code>turn_end.toolResults</code> 与 assistant 源顺序一致，模型看到的上下文也稳定。</span></li>
+              <li><b>L640</b><span><code>tool_execution_end</code> 在各自完成时立即发出，不受顺序约束。UI 可以实时显示“哪个先跑完”。</span></li>
+            </ul>
+          </div>
+
+          <div class="demo" data-demo="parallel">
+            <div class="demo-head">
+              <span class="title">三个工具调用：并行 vs 串行</span>
+              <span class="pill teal" data-par-mode>parallel</span>
+            </div>
+            <div class="demo-body">
+              <div class="parallel-body"></div>
+              <div class="par-total"><span>批次总耗时</span><b data-par-total>—</b></div>
+              <div class="demo-controls">
+                <button class="btn btn-sm" data-par-toggle type="button">切换为串行</button>
+                <span class="demo-note" style="margin:0">并行总耗时 ≈ 最慢的那个；串行是三者之和。实际延迟还受预检与网络影响。</span>
+              </div>
+            </div>
+          </div>
+
+          <h3>terminate：整批一致才提前结束</h3>
+          <p>工具结果可以带 <code>terminate: true</code>，表示“不需要再让模型继续”。但循环用的是 <code>every()</code>，不是 <code>some()</code>：</p>
+          <pre class="plain-tree">function shouldTerminateToolBatch(finalizedCalls) {
+  return finalizedCalls.length &gt; 0 &amp;&amp;
+    finalizedCalls.every(f =&gt; f.result.terminate === true);
+}</pre>
+          <p>这意味着一个工具不能替其他工具做决定。只有整批都认为“结束”，才跳过后续自动请求。混合批次继续，防止某个保守的工具意外截断整轮工作。</p>
+
+          <h2 id="queues"><span class="h2-num">3.5</span>Steering 与 Follow-up：两种“插话”</h2>
+          <p>这是 pi 最容易被误解的部分。两个队列都装用户消息，但语义完全不同：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th></th><th>Steering</th><th>Follow-up</th></tr></thead>
+              <tbody>
+                <tr><td>时机</td><td>agent 运行期间随时可入队；在<strong>当前工具批处理全部结束后</strong>注入</td><td>agent 本来要停止时才检查</td></tr>
+                <tr><td>语义</td><td>“方向不对，改做这个”</td><td>“做完之后，再做这个”</td></tr>
+                <tr><td>是否打断当前 assistant 消息</td><td>不会。已发出的工具调用全部执行完</td><td>不会。它等当前工作自然结束</td></tr>
+                <tr><td>循环位置</td><td>内层：每轮结束后轮询，作为下一轮的输入</td><td>外层：内层退出后轮询，塞回内层</td></tr>
+                <tr><td>模式</td><td><code>steeringMode</code>：one-at-a-time / all</td><td><code>followUpMode</code>：one-at-a-time / all</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 280" role="img" aria-label="steering 与 follow-up 时序">
+                <defs>
+                  <marker id="q3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <line class="dg-line" x1="30" y1="220" x2="730" y2="220"></line>
+                <text class="dg-sub" x="30" y="240">时间 →</text>
+
+                <rect class="dg-box" x="50" y="44" width="150" height="34"></rect>
+                <text class="dg-sub" x="62" y="66">LLM 流式响应</text>
+                <rect class="dg-box" x="210" y="44" width="170" height="34"></rect>
+                <text class="dg-sub" x="222" y="66">工具 A / B / C 执行</text>
+                <rect class="dg-box" x="390" y="44" width="140" height="34"></rect>
+                <text class="dg-sub" x="402" y="66">toolResult 落盘</text>
+                <rect class="dg-box-teal" x="540" y="44" width="160" height="34"></rect>
+                <text class="dg-sub" x="552" y="66">下一轮请求</text>
+
+                <rect class="dg-box-accent" x="250" y="120" width="100" height="30"></rect>
+                <text class="dg-sub" x="260" y="139">steer() 入队</text>
+                <path class="dg-line-dash" d="M300 150 V190 H580 V90" marker-end="url(#q3)"></path>
+                <text class="dg-sub" x="316" y="184">等整批工具结束 → 注入</text>
+
+                <rect class="dg-box-ochre" x="540" y="120" width="110" height="30"></rect>
+                <text class="dg-sub" x="550" y="139">followUp() 入队</text>
+                <path class="dg-line-dash" d="M595 150 V205 H710 V240" marker-end="url(#q3)"></path>
+                <text class="dg-sub" x="610" y="200">仅当没有工具 / steering 时</text>
+                <text class="dg-sub" x="620" y="262">再开一轮</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 3-3</b> steering 会改变“下一轮做什么”；follow-up 只在 agent 即将停止时把任务续上。两者都不会中断已经在跑的工具。</figcaption>
+          </figure>
+
+          <div class="callout warn">
+            <div class="callout-title">“打断”其实是“不开始下一轮”</div>
+            <p>用户按下 Esc 或发送 steering，不会杀死正在执行的 bash。真正的取消要传 <code>AbortSignal</code>。pi 的设计假设是：<strong>工具执行应当原子完成</strong>，否则文件可能处于半写入状态。需要强取消时，工具自己监听 signal。</p>
+          </div>
+
+          <h2 id="demo"><span class="h2-num">3.6</span>把一轮循环走一遍</h2>
+          <p>下面的单步演示对应 <code>runLoop</code> 的实际阶段。注意第 7 步：<code>finishTurn</code> 之后还要再轮询 steering；只有内层退出，才看 follow-up。</p>
+
+          <div class="demo loop-demo" data-demo="agentloop">
+            <div class="demo-head">
+              <span class="title">agent-loop.ts · 单步执行</span>
+              <span class="pill">turn lifecycle</span>
+            </div>
+            <div class="demo-body">
+              <div class="stepper">
+                <span class="step-chip">input</span>
+                <span class="step-chip">prepare</span>
+                <span class="step-chip">stream</span>
+                <span class="step-chip">preflight</span>
+                <span class="step-chip">execute</span>
+                <span class="step-chip">result</span>
+                <span class="step-chip">finish</span>
+                <span class="step-chip">decide</span>
+              </div>
+              <svg class="loop-demo-svg" viewBox="0 0 720 260" role="img" aria-label="agent loop 单步示意">
+                <defs>
+                  <marker id="d3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <rect class="n-box" data-step-node="0" x="18" y="34" width="118" height="46"></rect>
+                <text class="n-label" x="30" y="54">input</text>
+                <text class="n-sub" x="30" y="70">steering / prompt</text>
+
+                <rect class="n-box" data-step-node="1" x="180" y="34" width="132" height="46"></rect>
+                <text class="n-label" x="192" y="54">prepareRequest</text>
+                <text class="n-sub" x="192" y="70">projection + model</text>
+
+                <rect class="n-box" data-step-node="2" x="356" y="34" width="132" height="46"></rect>
+                <text class="n-label" x="368" y="54">stream</text>
+                <text class="n-sub" x="368" y="70">assistant events</text>
+
+                <rect class="n-box" data-step-node="3" x="532" y="34" width="132" height="46"></rect>
+                <text class="n-label" x="544" y="54">preflight</text>
+                <text class="n-sub" x="544" y="70">validate + hook</text>
+
+                <rect class="n-box" data-step-node="4" x="532" y="156" width="132" height="46"></rect>
+                <text class="n-label" x="544" y="176">execute</text>
+                <text class="n-sub" x="544" y="192">parallel / seq</text>
+
+                <rect class="n-box" data-step-node="5" x="356" y="156" width="132" height="46"></rect>
+                <text class="n-label" x="368" y="176">toolResult</text>
+                <text class="n-sub" x="368" y="192">content + details</text>
+
+                <rect class="n-box" data-step-node="6" x="180" y="156" width="132" height="46"></rect>
+                <text class="n-label" x="192" y="176">finishTurn</text>
+                <text class="n-sub" x="192" y="192">end / continue</text>
+
+                <rect class="n-box" data-step-node="7" x="18" y="156" width="118" height="46"></rect>
+                <text class="n-label" x="30" y="176">decide</text>
+                <text class="n-sub" x="30" y="192">queue / stop</text>
+
+                <path class="e" data-step-edge="0" d="M136 57 H180" marker-end="url(#d3)"></path>
+                <path class="e" data-step-edge="1" d="M312 57 H356" marker-end="url(#d3)"></path>
+                <path class="e" data-step-edge="2" d="M488 57 H532" marker-end="url(#d3)"></path>
+                <path class="e" data-step-edge="3" d="M598 80 V156" marker-end="url(#d3)"></path>
+                <path class="e" data-step-edge="4" d="M532 179 H488" marker-end="url(#d3)"></path>
+                <path class="e" data-step-edge="5" d="M356 179 H312" marker-end="url(#d3)"></path>
+                <path class="e" data-step-edge="6" d="M180 179 H136" marker-end="url(#d3)"></path>
+                <path class="e" data-step-edge="7" d="M77 156 V80" marker-end="url(#d3)"></path>
+              </svg>
+              <div class="event-log" style="margin-top:12px"></div>
+              <div class="demo-controls">
+                <button class="btn btn-sm" data-demo-next type="button">下一步 →</button>
+                <button class="btn btn-sm" data-demo-reset type="button">重置</button>
+                <span class="demo-note" style="margin:0">第 3–6 步对一个含 3 个工具调用的 turn 只发生一次；工具内部逐调用重复“预检→执行→结果”。</span>
+              </div>
+            </div>
+          </div>
+
+          <h2 id="critique"><span class="h2-num">3.7</span>设计评价：克制带来的可组合性</h2>
+          <p>pi-agent-core 的循环只有约 160 行，但它把几个容易纠缠的决策分开了：</p>
+          <ul>
+            <li><strong>循环不知道压缩、模型切换、会话持久化</strong>。这些通过 <code>prepareNextTurn</code> / <code>prepareRequest</code> / <code>finishTurn</code> 注入。</li>
+            <li><strong>工具失败不是控制流异常</strong>。所有失败都变成 <code>isError</code> 结果，循环只有一条路径。</li>
+            <li><strong>“继续”被拆成三个来源</strong>：工具结果、steering、follow-up。每个来源的检查位置不同，避免优先级混乱。</li>
+            <li><strong>顺序保证显式化</strong>：预检顺序、完成事件顺序、结果消息顺序，三者各有明确规则。</li>
+          </ul>
+          <p>代价是：<code>prepareNextTurn</code> 与 <code>finishTurn</code> 的时序很微妙（尤其与压缩、队列、错误交互），扩展作者必须理解这些钩子；否则容易出现“压缩后消息重复”“错误后又被 follow-up 拉起”之类的问题。这也是为什么产品层的 <code>AgentSession</code> 需要单独一章。</p>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>为什么外层循环只在 follow-up 有消息时继续？如果 steering 还有消息会怎样？</li>
+              <li>并行模式下，<code>tool_execution_end</code> 与 toolResult 消息的顺序分别是什么？</li>
+              <li>一个 <code>beforeToolCall</code> 返回 block 且 <code>terminate: true</code>，什么情况下循环仍会继续？</li>
+              <li><code>stopReason === "length"</code> 时为什么整批工具都不执行？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：AgentSession 与产品装配</span>
+            <span>Figures 3-1..3-3 · 2 live demos</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

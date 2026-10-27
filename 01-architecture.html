@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · 全景架构 — pi 源码之旅</title>
+<meta name="description" content="pi 的 monorepo 分层、依赖方向、一次 prompt 的完整生命周期，以及关键架构决策。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">全景架构</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 01 · Architecture</div>
+            <h1>先看整张地图，<br>再进第一行代码</h1>
+            <p class="lead">pi 不是一个“大而全”的 agent 框架。它把能力压到四个清晰的平面里：协议、运行时、harness、交互外壳。理解这四个平面的边界，后面每一处源码都会变得可预测。</p>
+            <div class="meta-row">
+              <span>阅读约 25 分钟</span>
+              <span>前置：Node/TS 基础</span>
+              <span>关键文件 6 个</span>
+            </div>
+          </header>
+
+          <h2 id="positioning"><span class="h2-num">1.1</span>pi 的定位：一个“可改造”的 harness</h2>
+          <p>README 的第一句话是：<em>“Pi is a minimal, extensible agent harness that you can make your own.”</em> 关键词不是 “agent”，而是 <strong>harness</strong>。模型负责推理，harness 负责让推理在真实世界里产生副作用：读文件、跑命令、改代码、保存会话、在终端里显示进度。</p>
+          <p>一个 coding agent 产品通常要回答五类问题：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>问题</th><th>pi 的回答</th><th>落在哪一层</th></tr></thead>
+              <tbody>
+                <tr><td>不同厂商的 API 怎么统一？</td><td>把所有差异收敛到 <code>Model</code> + <code>Message</code> + 事件流</td><td>pi-ai</td></tr>
+                <tr><td>模型要调工具，循环怎么停？</td><td>一个双层 loop + 可插拔的 finishTurn / steering</td><td>pi-agent-core</td></tr>
+                <tr><td>会话、上下文、压缩怎么管？</td><td>JSONL 树 + 投影（projection）+ 摘要条目</td><td>coding-agent</td></tr>
+                <tr><td>怎么让用户改造行为？</td><td>扩展、技能、提示模板、Pi packages</td><td>coding-agent</td></tr>
+                <tr><td>终端界面怎么不闪烁？</td><td>自研布局 + 行级差分渲染</td><td>pi-tui</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>它也明确<strong>不</strong>提供一些东西：没有内置的沙箱权限系统，没有 sub-agents，没有 plan mode（至少默认不带）。这些不是遗漏，而是产品哲学：核心保持薄，策略交给扩展和外部容器。</p>
+
+          <div class="callout warn">
+            <div class="callout-title">安全边界要先讲清楚</div>
+            <p>pi 的工具以启动它的操作系统用户权限运行；扩展是加载进同一进程的 TypeScript 模块，能读凭据、改文件、发网络请求。需要强隔离时，官方建议用容器或 micro-VM（见 <code>docs/containerization.md</code>）。读源码时不要把“没有权限系统”误解为“有隐式沙箱”。</p>
+          </div>
+
+          <h2 id="packages"><span class="h2-num">1.2</span>七个包，一条向下的依赖链</h2>
+          <p>仓库是一个 npm workspaces monorepo。真正支撑 CLI 的主干只有四个包：<code>pi-ai</code> → <code>pi-agent-core</code> → <code>pi-coding-agent</code>，外加独立演进的 <code>pi-tui</code>。其余包（chord、durable、mcp、env、codemode、telemetry、evals）围绕“可复用的 agent 基础设施”展开。</p>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 470" role="img" aria-label="pi monorepo 依赖图">
+                <defs>
+                  <marker id="dg-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+
+                <rect class="dg-band" x="20" y="18" width="720" height="108" rx="2"></rect>
+                <text class="dg-sub" x="34" y="38">SURFACE / HARNESS</text>
+
+                <rect class="dg-box-accent" x="286" y="48" width="188" height="58"></rect>
+                <text class="dg-label" x="302" y="72">pi-coding-agent</text>
+                <text class="dg-sub" x="302" y="88">CLI · sessions · tools · extensions</text>
+
+                <rect class="dg-box" x="34" y="48" width="120" height="58"></rect>
+                <text class="dg-label" x="50" y="72">pi-tui</text>
+                <text class="dg-sub" x="50" y="88">differential renderer</text>
+
+                <rect class="dg-box" x="580" y="48" width="132" height="58"></rect>
+                <text class="dg-label" x="596" y="72">pi-mcp</text>
+                <text class="dg-sub" x="596" y="88">stdio · HTTP · OAuth</text>
+
+                <rect class="dg-band" x="20" y="142" width="720" height="104" rx="2"></rect>
+                <text class="dg-sub" x="34" y="162">RUNTIME</text>
+
+                <rect class="dg-box-teal" x="286" y="170" width="188" height="56"></rect>
+                <text class="dg-label" x="302" y="193">pi-agent-core</text>
+                <text class="dg-sub" x="302" y="209">loop · tools · events · queues</text>
+
+                <rect class="dg-box" x="34" y="170" width="120" height="56"></rect>
+                <text class="dg-label" x="50" y="193">pi-chord</text>
+                <text class="dg-sub" x="50" y="209">typed plugin host</text>
+
+                <rect class="dg-box" x="580" y="170" width="132" height="56"></rect>
+                <text class="dg-label" x="596" y="193">pi-codemode</text>
+                <text class="dg-sub" x="596" y="209">QuickJS sandbox</text>
+
+                <rect class="dg-band" x="20" y="262" width="720" height="104" rx="2"></rect>
+                <text class="dg-sub" x="34" y="282">PROTOCOL / DATA</text>
+
+                <rect class="dg-box-ochre" x="286" y="290" width="188" height="56"></rect>
+                <text class="dg-label" x="302" y="313">pi-ai</text>
+                <text class="dg-sub" x="302" y="329">models · messages · providers</text>
+
+                <rect class="dg-box" x="34" y="290" width="120" height="56"></rect>
+                <text class="dg-label" x="50" y="313">pi-durable</text>
+                <text class="dg-sub" x="50" y="329">harness runtime</text>
+
+                <rect class="dg-box" x="580" y="290" width="132" height="56"></rect>
+                <text class="dg-label" x="596" y="313">pi-env</text>
+                <text class="dg-sub" x="596" y="329">remote environments</text>
+
+                <rect class="dg-box" x="286" y="392" width="188" height="48"></rect>
+                <text class="dg-label" x="302" y="413">pi-telemetry</text>
+                <text class="dg-sub" x="302" y="428">vendor-neutral spans</text>
+
+                <path class="dg-line flow" d="M380 106 V142" marker-end="url(#dg-arrow)"></path>
+                <path class="dg-line-dash flow" d="M130 106 C 190 106 220 198 286 198" marker-end="url(#dg-arrow)"></path>
+                <path class="dg-line-dash" d="M640 106 C 580 106 540 198 474 198" marker-end="url(#dg-arrow)"></path>
+                <path class="dg-line flow" d="M380 226 V262" marker-end="url(#dg-arrow)"></path>
+                <path class="dg-line-dash" d="M94 262 C 94 236 286 226 286 318" marker-end="url(#dg-arrow)"></path>
+                <path class="dg-line-dash" d="M94 262 C 94 250 286 240 286 318" marker-end="url(#dg-arrow)"></path>
+                <path class="dg-line-dash" d="M646 262 C 646 240 474 240 474 318" marker-end="url(#dg-arrow)"></path>
+                <path class="dg-line-dash" d="M286 345 C 230 345 210 410 286 416" marker-end="url(#dg-arrow)"></path>
+
+                <text class="dg-num" x="392" y="130">depends on</text>
+                <text class="dg-num" x="392" y="250">depends on</text>
+                <text class="dg-num" x="392" y="382">telemetry contracts</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 1-1</b> 实线是 CLI 的核心路径；虚线是可选依赖或能力接入。注意依赖只向下：底层不知道 CLI 的存在。</figcaption>
+          </figure>
+
+          <p>这条依赖方向是整个架构最重要的事实。它带来三个直接结果：</p>
+          <ul>
+            <li><strong>可嵌入</strong>：<code>pi-agent-core</code> 不依赖终端、不依赖文件系统，只依赖 <code>pi-ai</code> 的类型与流函数，所以可以被 SDK、RPC 服务甚至云端 runtime 复用。</li>
+            <li><strong>可替换</strong>：provider 由 <code>pi-ai</code> 的 <code>Provider</code> 接口描述，新增模型厂商不需要改 agent loop。</li>
+            <li><strong>可测试</strong>：<code>pi-agent-core</code> 接受一个 <code>streamFn</code>，测试里可以替换成纯粹的脚本化流，不需要网络。</li>
+          </ul>
+
+          <h2 id="planes"><span class="h2-num">1.3</span>三个平面：数据、控制、呈现</h2>
+          <p>比起包依赖，更有用的是按“职责平面”去读。pi 的代码基本可以放进这三个抽屉：</p>
+
+          <div class="card-grid three">
+            <div class="card" style="cursor:default">
+              <span class="num">DATA PLANE</span>
+              <h3>消息与轨迹</h3>
+              <p><code>Model</code>、<code>Message</code>、<code>AssistantMessageEvent</code>、<code>AgentEvent</code>、JSONL 条目。它们定义“发生了什么”，以及“模型看到了什么”。</p>
+            </div>
+            <div class="card" style="cursor:default">
+              <span class="num">CONTROL PLANE</span>
+              <h3>循环与决策</h3>
+              <p>agent loop、tool execution、steering / follow-up 队列、finishTurn、compaction、retry。它们决定“下一步做什么”。</p>
+            </div>
+            <div class="card" style="cursor:default">
+              <span class="num">PRESENTATION</span>
+              <h3>交互与渲染</h3>
+              <p>四个 mode、TUI 组件、主题、扩展 UI 请求。它们只消费事件，不改变模型上下文。</p>
+            </div>
+          </div>
+
+          <p>把这三个平面分开看，你会发现 pi 的一个隐含原则：<strong>呈现层不拥有状态，控制层不拥有界面，数据层不拥有策略。</strong> 例如 TUI 只订阅 <code>AgentSessionEvent</code>；会话是否压缩由 harness 决定；而 <code>pi-ai</code> 完全不知道“重试”或“队列”的存在。</p>
+
+          <h2 id="lifecycle"><span class="h2-num">1.4</span>一次 prompt 的完整生命周期</h2>
+          <p>下面这条路径是理解整个仓库的主线。建议在 IDE 里打开对应文件，顺着箭头读一遍。</p>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 430" role="img" aria-label="一次 prompt 的调用时序">
+                <defs>
+                  <marker id="seq-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--accent)"></path>
+                  </marker>
+                </defs>
+                <g class="seq">
+                  <text class="dg-label" x="38" y="26">User / UI</text>
+                  <text class="dg-label" x="164" y="26">AgentSession</text>
+                  <text class="dg-label" x="318" y="26">Agent</text>
+                  <text class="dg-label" x="444" y="26">pi-ai</text>
+                  <text class="dg-label" x="556" y="26">Provider</text>
+                  <text class="dg-label" x="662" y="26">SessionManager</text>
+
+                  <line class="dg-line" x1="70" y1="42" x2="70" y2="400"></line>
+                  <line class="dg-line" x1="210" y1="42" x2="210" y2="400"></line>
+                  <line class="dg-line" x1="350" y1="42" x2="350" y2="400"></line>
+                  <line class="dg-line" x1="476" y1="42" x2="476" y2="400"></line>
+                  <line class="dg-line" x1="600" y1="42" x2="600" y2="400"></line>
+                  <line class="dg-line" x1="700" y1="42" x2="700" y2="400"></line>
+
+                  <path class="dg-line flow" d="M70 70 H210" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="78" y="63">prompt(text)</text>
+
+                  <path class="dg-line flow" d="M210 104 H350" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="218" y="97">agent.prompt(messages)</text>
+
+                  <path class="dg-line flow" d="M350 138 H476" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="358" y="131">streamFn(model, transcript)</text>
+
+                  <path class="dg-line flow" d="M476 172 H600" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="484" y="165">HTTP / SSE</text>
+
+                  <path class="dg-line-dash" d="M600 206 H476" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="500" y="199">events</text>
+
+                  <path class="dg-line-dash" d="M476 240 H350" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="360" y="233">toolCall / done</text>
+
+                  <path class="dg-line flow" d="M350 274 H210" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="220" y="267">AgentEvent</text>
+
+                  <path class="dg-line flow" d="M210 308 H700" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="218" y="301">message_end → appendMessage</text>
+
+                  <path class="dg-line-dash" d="M700 342 H210" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="470" y="335">entry id / projection</text>
+
+                  <path class="dg-line flow" d="M210 376 H70" marker-end="url(#seq-arrow)"></path>
+                  <text class="dg-sub" x="84" y="369">session events</text>
+                </g>
+                <text class="dg-sub" x="34" y="418" fill="var(--muted)">实线：命令向下；虚线：数据/事件向上。工具执行在 Agent 内部完成，未单独画出。</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 1-2</b> 命令与事件是两条方向相反的流。理解这一点，就理解了为什么 TUI、RPC、SDK 能共用同一个内核。</figcaption>
+          </figure>
+
+          <ol>
+            <li><strong>输入预处理</strong>：<code>AgentSession.prompt()</code> 先尝试扩展命令，再跑 <code>input</code> 钩子，展开 <code>/skill:</code> 与提示模板。流式过程中提交的消息会按 <code>steer</code> 或 <code>followUp</code> 入队。</li>
+            <li><strong>启动 run</strong>：<code>_startRun()</code> 触发 <code>before_agent_start</code>，允许扩展替换系统提示、工具或上下文；然后构造 <code>AgentContext</code> 快照。</li>
+            <li><strong>进入循环</strong>：<code>runAgentLoop()</code> 添加消息、发 <code>agent_start</code> / <code>turn_start</code>，然后进入 <code>runLoop()</code> 的双层结构。</li>
+            <li><strong>投影与请求</strong>：<code>prepareRequest</code> 钩子把 <code>agent.state.messages</code> 换成 <code>SessionManager.buildSessionProjection()</code> 的结果——这是“模型实际看到的上下文”，可能已应用 compaction 与 context edit。</li>
+            <li><strong>流式响应</strong>：<code>streamAssistantResponse()</code> 调 <code>convertToLlm</code>，把 <code>AgentMessage[]</code> 降级为 provider 可理解的 <code>Message[]</code>，然后交给 <code>streamFn</code>。provider 适配器把 SSE 事件翻译成统一的 <code>AssistantMessageEvent</code>。</li>
+            <li><strong>工具执行</strong>：assistant 消息里的 <code>toolCall</code> 块被逐个准备、校验、执行、后处理，结果变成 <code>toolResult</code> 消息。</li>
+            <li><strong>持久化</strong>：每个 <code>message_end</code> 都会触发 <code>SessionManager.appendMessage()</code>，以 <code>id/parentId</code> 挂到当前叶子上。</li>
+            <li><strong>决定是否继续</strong>：还有工具调用、steering、follow-up，或 <code>finishTurn</code> 返回 <code>continue</code>，就进入下一 turn；否则 <code>agent_end</code>。</li>
+            <li><strong>收尾与恢复</strong>：<code>agent_end</code> 之后仍可能有自动重试、溢出恢复、压缩重试；真正空闲由 <code>agent_settled</code> 表示。</li>
+          </ol>
+
+          <div class="callout note">
+            <div class="callout-title">一个容易混淆的点</div>
+            <p><code>agent_end</code> 不是“彻底结束”。它只表示这一次低层 run 不再产生事件；harness 可能因重试、上下文溢出恢复或排队消息而启动新的 run。需要“真正空闲”时，用 <code>agent_settled</code>（SDK / 扩展语义）。</p>
+          </div>
+
+          <h2 id="loop-shape"><span class="h2-num">1.5</span>核心循环长什么样</h2>
+          <p>先看骨架。这里是 <code>runLoop</code> 的开头，注意“外层 while(true) + 内层 while(hasMoreToolCalls || pending)”的结构：</p>
+
+          <div class="code-panel" data-file="packages/agent/src/agent-loop.ts" data-lang="ts" data-start="172" data-highlight="16-22,35-40" data-nolines>
+            <div class="code-head">
+              <span class="path">packages/agent/src/agent-loop.ts</span>
+              <span class="right"><span class="lang">ts · 节选</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+async function runLoop(
+	initialContext: AgentContext,
+	newMessages: AgentMessage[],
+	initialConfig: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+	streamFunction: StreamFn,
+): Promise<void> {
+	let currentContext = initialContext;
+	let config = initialConfig;
+	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	let explicitContinuation = false;
+	// Check for steering messages at start (user may have typed while waiting)
+	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+
+	// Outer loop: continues when queued follow-up messages arrive after agent would stop
+	while (true) {
+		let hasMoreToolCalls = true;
+
+		// Inner loop: process tool calls and steering messages
+		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			let preparedMessages: AgentMessage[] = [];
+			if (lastCompletedTurn) {
+				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+				if (nextTurnSnapshot) {
+					currentContext = nextTurnSnapshot.context ?? currentContext;
+					preparedMessages = nextTurnSnapshot.messages ?? [];
+					config = {
+						...config,
+						model: nextTurnSnapshot.model ?? config.model,
+						reasoning:
+							nextTurnSnapshot.thinkingLevel === undefined
+								? config.reasoning
+								: nextTurnSnapshot.thinkingLevel === "off"
+									? undefined
+									: nextTurnSnapshot.thinkingLevel,
+					};
+				}
+				// Preparation can be long-running (for example, compaction). Pick up steering
+				// queued while it ran. Only poll again if the earlier poll returned nothing;
+				// otherwise one-at-a-time mode would deliver two messages in this turn.
+				if (pendingMessages.length === 0) {
+					pendingMessages = (await config.getSteeringMessages?.()) || [];
+				}
+				await emit({ type: "turn_start" });
+			}
+			// ...
+		}
+		// ...
+	}
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L172</b><span><strong>纯函数式入口</strong>：不持有状态，所有可变态通过参数与回调进入。这让它可被 <code>Agent</code> 包装，也可被测试直接调用。</span></li>
+              <li><b>L187</b><span><strong>外层循环</strong>处理“agent 本来要停了，但队列里又来了 follow-up”的情况。它只在真正无事可做时退出。</span></li>
+              <li><b>L191</b><span><strong>内层循环</strong>处理工具调用与 steering。一次内层迭代 = 一次 assistant 请求 + 它触发的工具批次。</span></li>
+              <li><b>L195</b><span><code>prepareNextTurn</code> 是 harness 插入压缩、模型切换、提示更新的位置；它可能很慢，所以之后要再收一次 steering。</span></li>
+            </ul>
+          </div>
+
+          <p>注意 <code>runLoop</code> 不直接调用模型，也不直接执行工具。它通过 <code>streamFunction</code> 和 <code>AgentTool.execute</code> 两个端口与外界交互。这就是依赖倒置：核心定义协议，上层提供实现。</p>
+
+          <h2 id="decisions"><span class="h2-num">1.6</span>六个值得记住的架构决策</h2>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>决策</th><th>代码证据</th><th>收益 / 代价</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>消息即协议，provider 只做翻译</td>
+                  <td><code>pi-ai/src/types.ts</code> 的 <code>Message</code> / <code>AssistantMessageEvent</code></td>
+                  <td>新增厂商成本低；代价是要处理各家语义差异（reasoning、缓存、工具 ID、图片）。</td>
+                </tr>
+                <tr>
+                  <td>工具调用是消息内容，不是回调</td>
+                  <td><code>ToolCall</code> 块嵌在 <code>AssistantMessage.content</code></td>
+                  <td>天然可持久化、可重放、可并行；代价是参数流式解析必须容错。</td>
+                </tr>
+                <tr>
+                  <td>会话是 append-only 的树</td>
+                  <td><code>SessionManager</code> 的 <code>id/parentId</code> + <code>leafId</code></td>
+                  <td>分支/回溯不需要复制文件；代价是每次请求都要做投影。</td>
+                </tr>
+                <tr>
+                  <td>上下文由“投影”生成，而非直接改历史</td>
+                  <td><code>buildSessionProjection()</code></td>
+                  <td>压缩、编辑、恢复都不破坏原始记录；代价是多一层抽象。</td>
+                </tr>
+                <tr>
+                  <td>扩展是进程内代码</td>
+                  <td><code>ExtensionRunner</code> + jiti</td>
+                  <td>能力极强、开发体验好；代价是信任边界等于进程边界。</td>
+                </tr>
+                <tr>
+                  <td>TUI 自己管理终端</td>
+                  <td><code>pi-tui</code> 的 <code>TuiBase.doRender()</code></td>
+                  <td>无 React/Ink 依赖，控制力强；代价是要自己处理宽度、ANSI、光标、图像。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="entry-map"><span class="h2-num">1.7</span>源码入口地图</h2>
+          <p>如果你只有半小时，按这个顺序打开文件：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>顺序</th><th>文件</th><th>看什么</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td><code>packages/ai/src/types.ts</code></td><td><code>Message</code>、<code>Model</code>、<code>AssistantMessageEvent</code>：整个系统的“名词表”。</td></tr>
+                <tr><td>2</td><td><code>packages/agent/src/agent-loop.ts</code></td><td><code>runLoop</code>、<code>streamAssistantResponse</code>、<code>executeToolCalls</code>：系统的“动词”。</td></tr>
+                <tr><td>3</td><td><code>packages/agent/src/agent.ts</code></td><td><code>Agent</code> 如何包装 loop、维护状态、分发事件。</td></tr>
+                <tr><td>4</td><td><code>packages/coding-agent/src/core/agent-session.ts</code></td><td>产品级装配：提示、工具、扩展、压缩、重试。</td></tr>
+                <tr><td>5</td><td><code>packages/coding-agent/src/core/session-manager.ts</code></td><td>JSONL 树与上下文投影。</td></tr>
+                <tr><td>6</td><td><code>packages/coding-agent/src/main.ts</code></td><td>CLI 如何选择 mode、创建 session、进入 TUI/RPC/print。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>为什么 <code>pi-agent-core</code> 可以脱离 CLI 独立使用？</li>
+              <li>命令流与事件流的方向分别是什么？谁订阅谁？</li>
+              <li><code>agent_end</code> 与 <code>agent_settled</code> 的区别是什么？</li>
+              <li>为什么“会话历史”和“模型上下文”不是同一个东西？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：统一模型层 pi-ai</span>
+            <span>Figure 1-1 / 1-2 · SVG</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

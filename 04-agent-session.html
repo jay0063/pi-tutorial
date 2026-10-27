@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · AgentSession 与产品装配 — pi 源码之旅</title>
+<meta name="description" content="AgentSession 如何把 agent loop、会话存储、系统提示、扩展、压缩与重试装配成一个产品级 harness。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">AgentSession 与装配</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 04 · pi-coding-agent</div>
+            <h1>产品不是更大的循环，<br>而是一圈钩子</h1>
+            <p class="lead"><code>AgentSession</code> 没有重新实现 agent loop。它用组合与钩子，把“会话落盘、上下文投影、系统提示、压缩、重试、扩展、工具权限”缠在循环外面。这一章看它如何<strong>不改循环却改变行为</strong>。</p>
+            <div class="meta-row">
+              <span>阅读约 35 分钟</span>
+              <span>关键文件 1 个 · 2000+ 行</span>
+              <span>核心：钩子与投影</span>
+            </div>
+          </header>
+
+          <h2 id="role"><span class="h2-num">4.1</span>它到底负责什么</h2>
+          <p>把 <code>AgentSession</code> 当成一个“运行时容器”。它持有五个协作者，自己只做编排：</p>
+
+          <div class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 310" role="img" aria-label="AgentSession 的协作对象">
+                <rect class="dg-box-accent" x="270" y="118" width="210" height="66" rx="3"></rect>
+                <text class="dg-label" x="292" y="144">AgentSession</text>
+                <text class="dg-sub" x="292" y="162">编排 · 钩子 · 事件</text>
+
+                <rect class="dg-box" x="34" y="30" width="170" height="58"></rect>
+                <text class="dg-label" x="48" y="52">Agent</text>
+                <text class="dg-sub" x="48" y="70">runLoop · 队列 · 工具</text>
+
+                <rect class="dg-box" x="34" y="216" width="170" height="58"></rect>
+                <text class="dg-label" x="48" y="238">SessionManager</text>
+                <text class="dg-sub" x="48" y="256">JSONL · 投影 · 分支</text>
+
+                <rect class="dg-box" x="556" y="30" width="170" height="58"></rect>
+                <text class="dg-label" x="570" y="52">ExtensionRunner</text>
+                <text class="dg-sub" x="570" y="70">钩子 · 工具 · 命令</text>
+
+                <rect class="dg-box" x="556" y="216" width="170" height="58"></rect>
+                <text class="dg-label" x="570" y="238">ModelRuntime</text>
+                <text class="dg-sub" x="570" y="256">模型 · 认证 · 路由</text>
+
+                <rect class="dg-box" x="270" y="30" width="210" height="52"></rect>
+                <text class="dg-label" x="286" y="52">SettingsManager</text>
+                <text class="dg-sub" x="286" y="68">压缩阈值 · 重试 · UI</text>
+
+                <rect class="dg-box" x="270" y="228" width="210" height="52"></rect>
+                <text class="dg-label" x="286" y="250">ResourceLoader</text>
+                <text class="dg-sub" x="286" y="266">技能 · 提示模板 · 上下文</text>
+
+                <path class="dg-line" d="M204 70 C 240 70 240 120 270 130" marker-end="url(#a4)"></path>
+                <path class="dg-line" d="M204 244 C 240 244 240 184 270 172" marker-end="url(#a4)"></path>
+                <path class="dg-line" d="M480 130 C 512 130 512 70 556 62" marker-end="url(#a4)"></path>
+                <path class="dg-line" d="M480 172 C 512 172 512 244 556 244" marker-end="url(#a4)"></path>
+                <path class="dg-line" d="M375 118 V82" marker-end="url(#a4)"></path>
+                <path class="dg-line" d="M375 184 V228" marker-end="url(#a4)"></path>
+                <defs>
+                  <marker id="a4" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 4-1</b> 组合而非继承。Session 给 Agent 安装钩子，订阅它的事件，并把事件同时分发给扩展与 UI。</figcaption>
+          </div>
+
+          <p>按职责列一下它的“产品逻辑”：</p>
+          <ul>
+            <li><strong>输入侧</strong>：扩展命令、输入拦截、技能/模板展开、图片缩放、流式期间排队。</li>
+            <li><strong>请求侧</strong>：压缩检查、<code>before_agent_start</code>、系统提示差量、工具装载、模型路由。</li>
+            <li><strong>运行侧</strong>：把 agent 事件持久化、转发给扩展与 UI、维护队列显示、记录嵌套工具调用。</li>
+            <li><strong>结束侧</strong>：自动重试、溢出恢复、阈值压缩、<code>agent_before_settle</code> 边界、空闲通知。</li>
+          </ul>
+
+          <h2 id="wiring"><span class="h2-num">4.2</span>构造：六次钩子安装</h2>
+          <p>构造函数的后半段最能说明架构。它先订阅 agent 事件，然后依次安装六组钩子：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/agent-session.ts" data-lang="ts" data-start="511" data-highlight="7-9">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/agent-session.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+		// Always subscribe to agent events for internal handling
+		// (session persistence, extensions, auto-compaction, retry logic)
+		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this._installAgentToolHooks();
+		this._installAgentNextTurnRefresh();
+		this._installAgentRequestProjection();
+		this._installAgentBoundaryHooks();
+		this._installHiddenDeclarationsProjection();
+		this._installAgentForcedPromptProjection();
+
+		this._buildRuntime({
+			activeToolNames: this._initialActiveToolNames,
+			includeAllExtensionTools: true,
+		});
+            </script>
+            <ul class="code-notes">
+              <li><b>L513</b><span><strong>单一事件入口</strong>。<code>_handleAgentEvent</code> 同时负责持久化、扩展分发、UI 通知、压缩与重试状态。所有产品逻辑都从这里长出来。</span></li>
+              <li><b>L514</b><span>工具钩子：把 <code>beforeToolCall</code> / <code>afterToolCall</code> 接到扩展的 <code>tool_call</code> / <code>tool_result</code> 事件上。</span></li>
+              <li><b>L515</b><span>下一轮刷新：压缩、系统提示更新、工具装载，都在 <code>prepareNextTurn</code> 里做。</span></li>
+              <li><b>L516</b><span>请求投影：每次请求前，把 <code>agent.state.messages</code> 换成会话投影，而不是直接改历史。</span></li>
+              <li><b>L517-519</b><span>边界钩子、隐藏工具投影、强制系统提示投影。它们都是<strong>包装上一个钩子</strong>，形成责任链。</span></li>
+            </ul>
+          </div>
+
+          <p>注意最后三组都是“包装”：<code>const previous = this.agent.prepareRequest; this.agent.prepareRequest = async (...) =&gt; { ... previous?.(...) }</code>。这允许不同子系统独立安装，不互相覆盖。读代码时看到 <code>previousX</code>，就要意识到可能还有更早的包装者。</p>
+
+          <h2 id="prompt"><span class="h2-num">4.3</span>一次 prompt 的完整管道</h2>
+          <p><code>prompt()</code> 不是“把字符串丢给模型”。它是一条有十几个站点的管道，每一站都可能拦截或改写：</p>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 330" role="img" aria-label="prompt 管道">
+                <defs>
+                  <marker id="a4b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <rect class="dg-box" x="20" y="24" width="150" height="46"></rect>
+                <text class="dg-label" x="34" y="44">prompt(text)</text>
+                <text class="dg-sub" x="34" y="60">用户输入</text>
+
+                <rect class="dg-box" x="206" y="24" width="150" height="46"></rect>
+                <text class="dg-label" x="220" y="44">扩展命令？</text>
+                <text class="dg-sub" x="220" y="60">/cmd 直接执行</text>
+
+                <rect class="dg-box" x="392" y="24" width="150" height="46"></rect>
+                <text class="dg-label" x="406" y="44">input handlers</text>
+                <text class="dg-sub" x="406" y="60">可 handled / transform</text>
+
+                <rect class="dg-box" x="578" y="24" width="160" height="46"></rect>
+                <text class="dg-label" x="592" y="44">模板 / 技能展开</text>
+                <text class="dg-sub" x="592" y="60">/skill:name args</text>
+
+                <rect class="dg-box-ochre" x="578" y="120" width="160" height="46"></rect>
+                <text class="dg-label" x="592" y="140">流式中？</text>
+                <text class="dg-sub" x="592" y="156">steer / followUp</text>
+
+                <rect class="dg-box" x="392" y="120" width="150" height="46"></rect>
+                <text class="dg-label" x="406" y="140">认证 / 模型校验</text>
+                <text class="dg-sub" x="406" y="156">无 key 直接报错</text>
+
+                <rect class="dg-box" x="206" y="120" width="150" height="46"></rect>
+                <text class="dg-label" x="220" y="140">_prepareRun</text>
+                <text class="dg-sub" x="220" y="156">压缩 / before_agent_start</text>
+
+                <rect class="dg-box" x="20" y="120" width="150" height="46"></rect>
+                <text class="dg-label" x="34" y="140">_startRun</text>
+                <text class="dg-sub" x="34" y="156">agent.prompt(messages)</text>
+
+                <rect class="dg-box-teal" x="206" y="220" width="356" height="46"></rect>
+                <text class="dg-label" x="220" y="240">post-run loop</text>
+                <text class="dg-sub" x="220" y="256">retry → compaction → before_settle → continue</text>
+
+                <rect class="dg-box" x="600" y="220" width="138" height="46"></rect>
+                <text class="dg-label" x="614" y="240">agent_end</text>
+                <text class="dg-sub" x="614" y="256">settled / idle</text>
+
+                <path class="dg-line" d="M170 47 H206" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M356 47 H392" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M542 47 H578" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M658 70 V120" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M578 143 H542" marker-end="url(#a4b)"></path>
+                <text class="dg-sub" x="662" y="102">是 · 排队</text>
+                <path class="dg-line" d="M542 143 H392" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M392 143 H356" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M356 143 H206" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M170 143 H95 V120" marker-end="url(#a4b)"></path>
+                <text class="dg-sub" x="550" y="112">否</text>
+                <path class="dg-line-dash" d="M95 166 V220 H206" marker-end="url(#a4b)"></path>
+                <path class="dg-line" d="M562 243 H600" marker-end="url(#a4b)"></path>
+                <path class="dg-line-dash" d="M384 266 V292 H95 V166" marker-end="url(#a4b)"></path>
+                <text class="dg-sub" x="404" y="286">需要继续：重试 / 溢出恢复 / 排队消息</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 4-2</b> 输入侧的每个拦截点都在 <code>prompt()</code> 内；运行结束后的恢复逻辑在 <code>_startRun()</code> 的 post-run 循环里。</figcaption>
+          </figure>
+
+          <h3>运行前：<code>_prepareRun</code></h3>
+          <p>它做四件事，顺序不能换：</p>
+          <ol>
+            <li>如果上一条 assistant 消息导致上下文过大，先尝试压缩（包括被中止的响应）。</li>
+            <li>触发 <code>before_agent_start</code>，让扩展修改系统提示、模型或工具；扩展也可以直接返回附加消息。</li>
+            <li>归一化图片（按最终模型的输入限制缩放），并把缩放提示拼进用户文本。</li>
+            <li>把起始消息、待注入的 nextTurn 消息、扩展返回的消息排好序；如果系统提示有变化，先插一条 system patch。</li>
+          </ol>
+
+          <div class="callout note">
+            <div class="callout-title">为什么先压缩再跑 before_agent_start</div>
+            <p>压缩会改写模型可见的上下文；如果先跑扩展钩子，扩展基于旧上下文做的决策可能立刻失效。pi 选择“先把房间收拾好，再请客人进来”。</p>
+          </div>
+
+          <h3>运行中：不是“一次 <code>agent.prompt</code> 就结束”</h3>
+          <p><code>_startRun</code> 调完 <code>agent.prompt()</code> 后进入一个 <code>while</code>：只要 <code>_handlePostAgentRun()</code> 返回 true（需要重试、溢出恢复、或有排队消息），就再调 <code>agent.continue()</code>。之后还会跑 <code>agent_before_settle</code> 边界；扩展若要求继续，同样 <code>continue()</code>。</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/agent-session.ts" data-lang="ts" data-start="1898" data-highlight="2-11,13-18">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/agent-session.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+		try {
+			await this.agent.prompt(messages);
+			while (!this._agentRunAbortRequested) {
+				if (await this._handlePostAgentRun()) {
+					if (this._agentRunAbortRequested) break;
+					await this.agent.continue();
+					continue;
+				}
+				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+				if (this._agentRunAbortRequested) break;
+				await this.agent.continue();
+			}
+		} finally {
+			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._failedResponse = undefined;
+			this._runSystemPromptOptions = undefined;
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			await this._emitAgentSettled();
+		}
+            </script>
+            <ul class="code-notes">
+              <li><b>L1901</b><span><code>agent.prompt()</code> 自己会一直跑到 <code>agent_end</code>；这里的循环是<strong>产品级重试/恢复</strong>，不是 agent loop 的替代。</span></li>
+              <li><b>L1904</b><span><code>agent.continue()</code> 从现有 transcript 继续，不新增用户消息。它依赖尾部是 user/toolResult，而不是 assistant。</span></li>
+              <li><b>L1908</b><span><code>agent_before_settle</code> 是“这次真的没事了”之前最后一个可插入工作的边界；它也能要求继续。</span></li>
+              <li><b>L1910-1916</b><span><code>finally</code> 保证无论成功、失败、取消，都清理临时状态并发出 <code>agent_settled</code>。空闲等待者靠这个信号被唤醒。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="projection"><span class="h2-num">4.4</span>投影：让 agent 看到的 ≠ 磁盘上存的</h2>
+          <p>这是整个 harness 最重要的设计之一。磁盘上的 JSONL 是<strong>只追加的事实</strong>；模型看到的是<strong>经过投影的视图</strong>。压缩、分支、上下文编辑、隐藏工具，都只改变投影，不删原始记录。</p>
+
+          <p><code>_installAgentRequestProjection()</code> 在每次请求前做替换：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/agent-session.ts" data-lang="ts" data-start="792" data-highlight="4-8,10-12">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/agent-session.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+			const prepare = async () => {
+				const projection = this.sessionManager.buildSessionProjection();
+				const canonicalContext = {
+					...request.context,
+					messages: projection.messages,
+					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
+					tools: this.agent.state.tools.slice(),
+				};
+				const previous = await previousPrepareRequest?.(
+					{
+						...request,
+						context: canonicalContext,
+						model: this.agent.state.model,
+						thinkingLevel: this.agent.state.thinkingLevel,
+					},
+					signal,
+				);
+				return { previous, context: previous?.context ?? canonicalContext, projection };
+			};
+            </script>
+            <ul class="code-notes">
+              <li><b>L793</b><span><strong>每次请求都重建投影</strong>。没有“上次投影缓存”，避免状态不一致；投影本身是线性扫描，成本可接受。</span></li>
+              <li><b>L796</b><span>模型可见消息来自会话投影，而不是 <code>agent.state.messages</code> 的原始累积。</span></li>
+              <li><b>L797-798</b><span><strong>工具是两套东西</strong>：消息里的 system 声明“模型可以调用什么”；<code>context.tools</code> 是“运行时能执行什么”。投影负责让两者一致。</span></li>
+              <li><b>L800</b><span>包装链：先让内层钩子（可能是别的子系统）改写，再以自己的上下文为准。返回值里的 <code>projection</code> 供后续压缩判断复用。</span></li>
+            </ul>
+          </div>
+
+          <p>为什么不让 agent 直接持有“当前历史”？因为一旦直接改数组，很多不变量会破：工具调用与结果必须成对、assistant 的 toolCall id 必须唯一、压缩边界必须原子。投影把所有这些规则集中在一个纯函数里（<code>buildSessionProjection</code>），agent 只消费结果。</p>
+
+          <div class="callout tip">
+            <div class="callout-title">心智模型</div>
+            <p>把 JSONL 想成 git 的对象库，把投影想成工作区。压缩是“新的提交”，不是“删除文件”；上下文编辑是“覆盖某一行”，原始行仍在。这个类比在第五章会展开。</p>
+          </div>
+
+          <h2 id="prompt-build"><span class="h2-num">4.5</span>系统提示：结构化区块 + 差量补丁</h2>
+          <p>pi 不把系统提示当一个大字符串存。它被拆成有名字的 section（身份、规则、工具说明、项目上下文、技能等），每次只把<strong>变化的 section</strong>写成一条 system 消息：</p>
+
+          <pre class="plain-tree">SystemMessage {
+  role: "system",
+  content: "",
+  sections: {
+    tools: "…",          // 只包含发生变化的 section
+    guidelines: "…"
+  },
+  toolsAdded: [...],
+  toolsRemoved: [...]
+}</pre>
+
+          <p><code>_preparePromptAndToolLoadout()</code> 负责计算差量。它同时处理工具列表与提示文本：工具被隐藏时，对应的说明也必须消失，否则模型会看到“不存在的工具”。</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/agent-session.ts" data-lang="ts" data-start="1758" data-highlight="4-10,12">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/agent-session.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	private _preparePromptAndToolLoadout(
+		options: NormalizedBuildSystemPromptOptions,
+		messages: AgentMessage[] = this.agent.state.messages,
+	): SystemMessage | undefined {
+		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
+		// The tool list and rules must match the declarations the request carries.
+		options.hiddenTools = [...this._hiddenDeclarations];
+		const sections = diffSystemPromptSections(
+			getCurrentSystemMessage(messages)?.sections ?? {},
+			buildSystemPromptSections(options),
+		);
+		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L1761</b><span>先应用工具负载（allowlist、exclude、隐藏、MCP 连接状态），再取名字。顺序错了会把不该出现的工具写进提示。</span></li>
+              <li><b>L1764</b><span><code>hiddenTools</code> 与声明保持一致，避免“提示里有、请求里没有”。</span></li>
+              <li><b>L1765-1768</b><span>与当前系统消息做 diff；没有变化就返回 <code>undefined</code>，<strong>不产生空补丁</strong>。这让连续请求的 transcript 保持干净。</span></li>
+              <li><b>L1769</b><span><code>content: ""</code> 是有意的：结构化 section 才是事实来源，渲染发生在 provider 投影时。</span></li>
+            </ul>
+          </div>
+
+          <p>对不支持“对话中途改系统提示”的模型，<code>_installAgentForcedPromptProjection()</code> 会把所有 system 消息折叠成请求开头的一条。这样同一份 transcript 可以服务两类 provider，不需要在存储层做分支。</p>
+
+          <h2 id="compaction"><span class="h2-num">4.6</span>压缩与溢出恢复：三种情况，一次机会</h2>
+          <p><code>_checkCompaction()</code> 的注释列了三种自动压缩。把它们分开看，逻辑就清楚了：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>情况</th><th>触发</th><th>是否重试</th><th>为什么</th></tr></thead>
+              <tbody>
+                <tr><td>1. 溢出 + 重试</td><td>context overflow 错误，或可恢复的 length stop</td><td>是，整轮一次</td><td>响应没完成，压缩后重发请求可能成功。</td></tr>
+                <tr><td>2. 溢出 + 不重试</td><td>响应成功，但 usage 超过窗口</td><td>否</td><td>结果已经拿到；<code>continue()</code> 无法从 assistant 尾部继续。</td></tr>
+                <tr><td>3. 阈值</td><td>投影估算超过阈值</td><td>否</td><td>只是预防性整理，不改变已完成的轮次。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>“一次机会”由 <code>_overflowRecoveryAttempted</code> 控制。失败后再次溢出会直接发出 <code>compaction_end</code> 错误，而不是无限循环。另一个容易忽略的细节：如果错误来自<strong>另一个模型</strong>（用户切到了更大窗口的模型），不会触发压缩，因为旧模型的限制不适用于新请求。</p>
+
+          <h3>压缩发生在哪两个位置</h3>
+          <ul>
+            <li><strong>下一轮开始前</strong>：<code>_installAgentNextTurnRefresh</code> 调 <code>_compactBeforeNextAssistantResponse</code>，用当前模型与投影判断阈值。</li>
+            <li><strong>请求前</strong>：虚拟模型路由后，用实际路由到的模型再判断一次；若超阈值，重新投影并压缩。</li>
+          </ul>
+          <p>压缩本身不改 JSONL 的旧条目，而是追加一条 <code>compaction</code> 条目，记录 summary、保留起点、压缩前 token 数。投影从这条条目开始重建上下文。</p>
+
+          <h2 id="retry"><span class="h2-num">4.7</span>重试：把失败响应“重放”一次</h2>
+          <p>自动重试与压缩不同：它发生在 <code>agent_end</code> 之后，由 <code>_handlePostAgentRun()</code> 判断最后一条 assistant 是否是可重试错误。关键设计是 <code>_failedResponse</code>：</p>
+          <ul>
+            <li>失败的 assistant 消息<strong>不再留在投影上下文里</strong>（否则模型会看到自己上次的失败输出）。</li>
+            <li>重试请求把这条消息作为 <code>failed</code> 传给模型路由，用于选择“重试”语义（例如同一模型、同一档位）。</li>
+            <li>成功响应会重置 <code>_retryAttempt</code>，避免一个长会话里错误累积到上限。</li>
+          </ul>
+          <p>重试之间有延迟（<code>retryDelayMs</code>），并通过 <code>auto_retry_start</code> / <code>auto_retry_end</code> 事件让 UI 显示倒计时。用户可以随时 abort，<code>_retryAbortController</code> 会取消等待。</p>
+
+          <div class="callout warn">
+            <div class="callout-title">错误也是需要清理的状态</div>
+            <p>如果失败响应带有工具调用，对应的 toolResult 也必须一起从投影中移除，否则会留下“孤儿结果”。<code>_omitRecoveryAttempt()</code> 用 context edit 把 assistant 与其工具结果成对隐藏——这是“追加式删除”的典型写法。</p>
+          </div>
+
+          <h2 id="hooks"><span class="h2-num">4.8</span>工具权限与扩展钩子</h2>
+          <p><code>AgentSession</code> 不实现权限系统，但它提供了挂载点。构造函数把 agent 的两个钩子直接接到扩展：</p>
+          <ul>
+            <li><code>beforeToolCall</code> → <code>tool_call</code> 处理器，可返回 <code>{ block, reason, terminate }</code>。</li>
+            <li><code>afterToolCall</code> → <code>tool_result</code> 处理器，可替换 content/details/isError/usage，之后还会做图片归一化。</li>
+          </ul>
+          <p>嵌套工具调用（工具通过 <code>ctx.executeTool()</code> 调另一个工具）也走同一套钩子，并带 <code>parentToolCallId</code>。这意味着权限检查无法被“套一层工具”绕过——这是安全设计上的重要细节。</p>
+
+          <p>但要注意 pi 的定位：<strong>它没有内置的沙箱或权限模型</strong>。默认情况下工具直接以当前用户身份执行；扩展运行在同一进程。安全性来自你安装的扩展、运行的容器、以及 <code>beforeToolCall</code> 钩子。<span class="text-muted">（详见第七章。）</span></p>
+
+          <h2 id="critique"><span class="h2-num">4.9</span>评价：薄循环，厚边界</h2>
+          <p><code>AgentSession</code> 超过 4000 行，但它的大部分代码不是“算法”，而是<strong>边界处理</strong>：压缩与重试的竞态、扩展钩子的顺序、取消与空闲的信号、投影与持久化的一致性。这恰好是产品级 harness 与教学 demo 的差别。</p>
+          <p>它的可读性依赖于一条纪律：所有对模型可见状态的修改，最终都汇聚到投影；所有对生命周期的干预，都通过少数几个钩子。破坏这条纪律的补丁会让系统迅速变得难以推理。读这部分源码时，建议始终问两个问题：</p>
+          <ol>
+            <li>这个操作改的是<strong>事实</strong>（JSONL）还是<strong>视图</strong>（投影）？</li>
+            <li>它发生在 agent loop 的哪个钩子里？如果发生在事件回调里，是否可能与下一轮请求竞态？</li>
+          </ol>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li><code>agent.state.messages</code> 与 <code>sessionManager.buildSessionProjection().messages</code> 为什么可能不同？</li>
+              <li>系统提示为什么要按 section 做 diff，而不是每次重发全文？</li>
+              <li>溢出恢复为什么只允许一次？什么样的错误不触发压缩？</li>
+              <li>扩展的 <code>tool_call</code> 钩子如何阻断一次工具调用？阻断结果会进入模型上下文吗？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：会话树与上下文投影</span>
+            <span>Figures 4-1..4-2</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

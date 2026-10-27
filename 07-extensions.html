@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · 扩展系统 — pi 源码之旅</title>
+<meta name="description" content="pi 扩展的加载、生命周期、事件组合模型、ExtensionAPI、技能、Pi packages、MCP 与进程内信任模型。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">扩展系统</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 07 · extensions</div>
+            <h1>把策略放进进程，<br>把风险留给自己</h1>
+            <p class="lead">pi 不内置权限系统，也不写死工作流。它提供一层<strong>进程内扩展</strong>：TypeScript 模块通过 <code>ExtensionAPI</code> 注册工具、命令与事件处理器，直接看到提示、工具调用与会话。这给了极大的自由度，也意味着扩展就是你的代码——同等的权限，同等的风险。</p>
+            <div class="meta-row">
+              <span>阅读约 30 分钟</span>
+              <span>关键文件 4 个</span>
+              <span>安全警告必读</span>
+            </div>
+          </header>
+
+          <div class="callout warn">
+            <div class="callout-title">信任模型：没有沙箱</div>
+            <p>扩展运行在 pi 进程内，拥有与 pi 相同的操作系统权限。它能读取凭据、修改文件、发网络请求，也能看到完整会话。只加载你信任的来源。项目级扩展/包只有在 <code>project_trust</code> 通过后才会加载，但“信任”是一次性的人类决定，不是技术隔离。</p>
+          </div>
+
+          <h2 id="what"><span class="h2-num">7.1</span>扩展、技能、包、MCP：别混为一谈</h2>
+          <p>pi 的“可扩展性”由四个不同层次组成，解决的问题不同：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>机制</th><th>是什么</th><th>能做什么</th><th>不能做什么</th></tr></thead>
+              <tbody>
+                <tr><td>Skill</td><td>带 frontmatter 的 <code>SKILL.md</code> + 资源文件</td><td>按需加载的指令、脚本、参考文档</td><td>不能注册工具或拦截事件</td></tr>
+                <tr><td>Extension</td><td>进程内 TypeScript 模块</td><td>工具、命令、事件钩子、provider、UI</td><td>不能跨进程隔离</td></tr>
+                <tr><td>Pi package</td><td>npm/git/本地目录</td><td>打包分发 extensions/skills/prompts/themes</td><td>本身不是运行时机制</td></tr>
+                <tr><td>MCP server</td><td>外部进程或 HTTP 服务</td><td>提供工具与资源，跨语言</td><td>能力受协议限制，需连接管理</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>选择原则：<strong>需要执行代码 → 扩展；只需要指令 → 技能；需要跨语言/隔离 → MCP；需要分发 → package。</strong></p>
+
+          <h2 id="loading"><span class="h2-num">7.2</span>加载：jiti 直接跑 TypeScript</h2>
+          <p>扩展不需要预编译。pi 用 <a href="https://github.com/unjs/jiti">jiti</a> 在运行时转译 TypeScript，并复用宿主模块与 tsconfig 路径。工厂函数可以是同步或异步的；异步工厂会被等待，因此可以在启动时拉取配置或注册 provider。</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/extensions/loader.ts" data-lang="ts" data-start="579" data-highlight="1-4,6-9,12-14">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/extensions/loader.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	const jiti = createJitiImpl(import.meta.url, {
+		moduleCache: false,
+		...resolutionOptions,
+	});
+
+	const module = await jiti.import(extensionPath, { default: true });
+	const factory = module as ExtensionFactory;
+	if (typeof factory !== "function") {
+		return undefined;
+	}
+	if (isCurrentCacheToken(cacheToken)) {
+		extensionCache.set(extensionPath, factory);
+	}
+	return factory;
+            </script>
+            <ul class="code-notes">
+              <li><b>L579</b><span><code>moduleCache: false</code> 让 <code>/reload</code> 能拿到新代码；否则 Node 的模块缓存会返回旧工厂。</span></li>
+              <li><b>L580</b><span><code>resolutionOptions</code> 区分三种运行形态：编译后的二进制（虚拟模块）、源码运行（tsconfig paths）、普通 Node 构建（dist alias）。</span></li>
+              <li><b>L584</b><span><code>{ default: true }</code> 只取默认导出；扩展必须 <code>export default function (pi) {…}</code>。</span></li>
+              <li><b>L589</b><span>缓存带 token：并发的加载/重载不会把旧工厂写回新缓存。</span></li>
+            </ul>
+          </div>
+
+          <p>最小扩展只需要注册一个工具：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/examples/extensions/hello.ts" data-lang="ts" data-start="1" data-highlight="13-24,25-26">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/examples/extensions/hello.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+/**
+ * Hello Tool - Minimal custom tool example
+ */
+
+import { Type } from "@earendil-works/pi-ai";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+const helloTool = defineTool({
+	name: "hello",
+	label: "Hello",
+	description: "A simple greeting tool",
+	parameters: Type.Object({
+		name: Type.String({ description: "Name to greet" }),
+	}),
+
+	async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		return {
+			content: [{ type: "text", text: `Hello, ${params.name}!` }],
+			details: { greeted: params.name },
+		};
+	},
+});
+
+export default function (pi: ExtensionAPI) {
+	pi.registerTool(helloTool);
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L8</b><span><code>defineTool()</code> 保留参数类型推断；直接写对象字面量也可以，但 <code>execute</code> 的 <code>params</code> 可能被放宽为 <code>unknown</code>。</span></li>
+              <li><b>L17-20</b><span>返回值必须同时有 <code>content</code>（给模型）和 <code>details</code>（给 UI）；没有结构化信息就写 <code>details: undefined</code>。</span></li>
+              <li><b>L25</b><span>注册即激活（<code>direct</code> 暴露）。若要按需激活，用 <code>defaultActive: false</code> 或 <code>exposure</code>。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="lifecycle"><span class="h2-num">7.3</span>生命周期：一次 run 的钩子顺序</h2>
+          <p>扩展事件不是一堆同质的回调。它们分布在不同的时间尺度上，从“输入还没变成消息”到“进程即将退出”。</p>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 340" role="img" aria-label="扩展生命周期">
+                <defs>
+                  <marker id="e7" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <rect class="dg-box" x="16" y="24" width="120" height="42"></rect>
+                <text class="dg-label" x="30" y="50">input</text>
+
+                <rect class="dg-box" x="164" y="24" width="150" height="42"></rect>
+                <text class="dg-label" x="178" y="50">before_agent_start</text>
+
+                <rect class="dg-box-teal" x="342" y="24" width="108" height="42"></rect>
+                <text class="dg-label" x="356" y="50">agent_start</text>
+
+                <rect class="dg-box" x="478" y="24" width="120" height="42"></rect>
+                <text class="dg-label" x="492" y="50">turns…</text>
+
+                <rect class="dg-box" x="626" y="24" width="110" height="42"></rect>
+                <text class="dg-label" x="640" y="50">agent_end</text>
+
+                <rect class="dg-box-ochre" x="626" y="120" width="110" height="46"></rect>
+                <text class="dg-label" x="638" y="140">before_settle</text>
+                <text class="dg-sub" x="638" y="156">可再续一次</text>
+
+                <rect class="dg-box-teal" x="626" y="220" width="110" height="42"></rect>
+                <text class="dg-label" x="638" y="246">settled</text>
+
+                <path class="dg-line" d="M136 45 H164" marker-end="url(#e7)"></path>
+                <path class="dg-line" d="M314 45 H342" marker-end="url(#e7)"></path>
+                <path class="dg-line" d="M450 45 H478" marker-end="url(#e7)"></path>
+                <path class="dg-line" d="M598 45 H626" marker-end="url(#e7)"></path>
+                <path class="dg-line" d="M681 66 V120" marker-end="url(#e7)"></path>
+                <path class="dg-line" d="M681 166 V220" marker-end="url(#e7)"></path>
+                <path class="dg-line-dash" d="M736 143 C 758 143 758 45 736 45" marker-end="url(#e7)"></path>
+                <text class="dg-sub" x="700" y="190">continue</text>
+
+                <rect class="dg-band" x="16" y="250" width="560" height="74"></rect>
+                <text class="dg-label" x="30" y="272">每个 turn 内部</text>
+                <text class="dg-sub" x="30" y="292">turn_start → context / context_with_system → 请求 → 工具钩子 → turn_end</text>
+                <text class="dg-sub" x="30" y="310">provider 钩子：headers → request → response → stream_event</text>
+
+                <text class="dg-sub" x="16" y="108">输入可被 handled / transform；</text>
+                <text class="dg-sub" x="16" y="124">before_agent_start 可改提示、工具、模型。</text>
+                <text class="dg-sub" x="16" y="156">agent_end 不是终态：重试、恢复、</text>
+                <text class="dg-sub" x="16" y="172">压缩重试、排队消息都可能再起一次 run。</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 7-1</b> run 级别的事件顺序。<code>agent_end</code> 只结束一次低层 run；<code>agent_settled</code> 才表示不会自动继续。</figcaption>
+          </figure>
+
+          <p>会话生命周期是另一条线：<code>project_trust</code> → <code>session_start</code> →（切换/分叉时）<code>session_before_switch</code> / <code>session_before_fork</code> → <code>session_shutdown</code>。重载会让旧运行时失效；<code>await ctx.reload()</code> 之后的代码仍属于旧运行时，不能复用它的会话状态。</p>
+
+          <h2 id="composition"><span class="h2-num">7.4</span>事件组合模型：五种语义</h2>
+          <p>事件类型很多，但组合方式只有五种。理解这个分类，比背事件名有用：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>模式</th><th>行为</th><th>典型事件</th></tr></thead>
+              <tbody>
+                <tr><td>通知</td><td>返回值忽略，只观察</td><td><code>agent_start</code>、<code>agent_settled</code>、<code>provider_stream_event</code></td></tr>
+                <tr><td>就地修改</td><td>后续处理器看到前者的修改</td><td><code>before_provider_headers</code>、<code>tool_call.input</code></td></tr>
+                <tr><td>链式变换</td><td>后一个收到前一个的返回值</td><td><code>input</code>、<code>context</code>、<code>message_end</code>、<code>tool_result</code></td></tr>
+                <tr><td>闸门</td><td>返回 handled/block/cancel 终止正常路径</td><td><code>tool_call</code>、<code>user_bash</code>、<code>session_before_*</code></td></tr>
+                <tr><td>可操作边界</td><td>看到已提议的 entries 与 continue 决定，可追加</td><td><code>turn_end</code>、<code>agent_before_settle</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>处理器按扩展加载与注册顺序运行；<code>pi.on()</code> 返回取消订阅函数，且不影响正在进行的派发（派发用的是快照）。</p>
+
+          <h3>错误处理并不统一</h3>
+          <p>大多数事件里，某个处理器抛错会被捕获、报告给 <code>emitError</code>，然后继续下一个处理器。但 <code>tool_call</code> 是例外：<code>emitToolCall()</code> 不捕获，错误会冒泡到 agent 的工具准备阶段，被转成一条错误 toolResult，从而<strong>阻止该工具执行</strong>。这是有意为之——权限钩子失败时应当 fail closed（拒绝），而不是放行。</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/src/core/extensions/runner.ts" data-lang="ts" data-start="1249" data-highlight="3-8,10-12,15">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/src/core/extensions/runner.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
+		const ctx = this.createContext();
+		let result: ToolCallEventResult | undefined;
+
+		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
+			for (const handler of handlers) {
+				const handlerResult = await handler(event, ctx);
+
+				if (handlerResult) {
+					result = handlerResult as ToolCallEventResult;
+					if (result.block) {
+						return result;
+					}
+				}
+			}
+		}
+
+		return result;
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L1251</b><span>没有 try/catch。任何处理器抛错都会让整次工具调用失败——这是安全边界上的刻意选择。</span></li>
+              <li><b>L1257-1261</b><span>第一个 <code>block: true</code> 立即短路。之后的处理器不会再看到这个调用。</span></li>
+              <li><b>L1266</b><span>若没有 block，返回最后一个非空结果（通常带 <code>terminate</code> 之类的提示）。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="api"><span class="h2-num">7.5</span>ExtensionAPI：能力清单</h2>
+          <p>工厂函数拿到的 <code>pi</code> 对象是扩展的全部入口。常用的能力可以分成六类：</p>
+
+          <div class="grid-2">
+            <div class="mini-card">
+              <h4>注册能力</h4>
+              <p><code>registerTool</code>、<code>registerCommand</code>、<code>registerShortcut</code>、<code>registerFlag</code>、<code>registerProvider</code>、<code>registerMcpServer</code>、<code>registerVirtualModel</code>。</p>
+            </div>
+            <div class="mini-card">
+              <h4>监听事件</h4>
+              <p><code>pi.on(event, handler)</code>。返回取消函数。处理器按注册顺序运行。</p>
+            </div>
+            <div class="mini-card">
+              <h4>消息与会话</h4>
+              <p><code>sendUserMessage</code>、<code>sendMessage</code>、<code>appendEntry</code>、<code>setActiveTools</code>、模型/思考档位控制。</p>
+            </div>
+            <div class="mini-card">
+              <h4>工具编排</h4>
+              <p><code>ctx.executeTool()</code> 走完整校验与钩子；<code>ctx.tools</code> 列出可调用工具。</p>
+            </div>
+            <div class="mini-card">
+              <h4>终端 UI</h4>
+              <p><code>ctx.ui.notify</code>、<code>confirm</code>、自定义渲染器、状态行；仅在交互模式可用。</p>
+            </div>
+            <div class="mini-card">
+              <h4>扩展间通信</h4>
+              <p><code>pi.events</code> 提供轻量事件总线；共享状态应通过 session entry 持久化。</p>
+            </div>
+          </div>
+
+          <h3>一个权限扩展</h3>
+          <p>下面这段来自官方文档，演示如何用工具注解（MCP 语义）决定是否需要确认：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/docs/extensions.md" data-lang="ts" data-start="282" data-highlight="2-5,6-7">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/docs/extensions.md（示例）</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+pi.on("tool_call", async (event, ctx) => {
+  const hints = pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations;
+  const needsApproval =
+    hints?.destructiveHint === true ||
+    (!hints?.readOnlyHint && ((hints?.destructiveHint ?? true) || (hints?.openWorldHint ?? true)));
+  if (needsApproval && !(await ctx.ui.confirm("Allow tool call?", event.toolName))) {
+    return { block: true, reason: `${event.toolName} was not approved` };
+  }
+});
+            </script>
+            <ul class="code-notes">
+              <li><b>L283</b><span>注解是<strong>提示</strong>，不是保证。恶意或被攻陷的 MCP server 可以谎报 <code>readOnlyHint</code>；高风险场景应维护自己的白名单。</span></li>
+              <li><b>L285</b><span>缺失注解时按 MCP 默认值处理：非只读、可能破坏性、可能接触开放世界。未知即危险。</span></li>
+              <li><b>L287</b><span>用户拒绝 → <code>block</code>。理由会进入 toolResult，模型能看到并调整策略。</span></li>
+            </ul>
+          </div>
+
+          <p>注意 <code>ctx.ui.confirm</code> 只在交互模式可用。在 print/JSON/RPC 模式下，扩展要么自动放行，要么直接拒绝；不能假设有人在场点“同意”。这也是为什么权限策略最好显式区分运行模式。</p>
+
+          <h2 id="exposure"><span class="h2-num">7.6</span>工具暴露：不是所有工具都直接给模型</h2>
+          <p>扩展可以注册很多工具，但并非都要出现在系统提示里。pi 用 <code>exposure</code> 控制“模型如何到达这个工具”：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>exposure</th><th>声明给模型</th><th>可被其他工具调用</th><th>典型用途</th></tr></thead>
+              <tbody>
+                <tr><td><code>direct</code>（默认）</td><td>激活时是</td><td>激活时是</td><td>普通工具，如 read/write。</td></tr>
+                <tr><td><code>model-only</code></td><td>激活时是</td><td>否</td><td>需要用户确认、编排其他工具的工具。</td></tr>
+                <tr><td><code>codemode</code></td><td>仅显式激活</td><td>始终可</td><td>被脚本批量调用，不占系统提示。</td></tr>
+                <tr><td><code>deferred</code></td><td>仅显式激活</td><td>始终可</td><td>由 <code>tool_search</code> 发现后激活。</td></tr>
+                <tr><td><code>hidden</code></td><td>否</td><td>否</td><td>注册但不可达；用于“撤回”工具。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>这解决了一个真实问题：工具太多会撑爆系统提示，也会让模型选择困难。pi 的策略是“按需暴露”：默认只给核心工具，其余通过 <code>codemode</code> 或 <code>tool_search</code> 间接使用。</p>
+
+          <h2 id="trust"><span class="h2-num">7.7</span>安全：自由与责任的边界</h2>
+          <p>pi 的安全模型可以概括为三句话：</p>
+          <ol>
+            <li><strong>扩展是代码，不是配置</strong>。它能做 pi 能做的一切，包括读 <code>~/.ssh</code>、发请求、改会话文件。</li>
+            <li><strong>项目资源需要信任</strong>。项目级扩展与包在 <code>project_trust</code> 之后才加载；个人扩展与显式 <code>--extension</code> 不经过这道门。</li>
+            <li><strong>没有内置沙箱</strong>。要隔离，用容器、虚拟机、受限用户，或只加载审计过的扩展。</li>
+          </ol>
+
+          <p>官方文档甚至建议：把扩展当作“你和你的团队写的代码”来审查；第三方 package 要先看源码；不要让不可信仓库的 <code>.pi/</code> 配置自动生效。这不是过度谨慎——一个 <code>tool_call</code> 钩子就能把 <code>rm -rf</code> 包装成“安全”的 <code>clean</code> 工具。</p>
+
+          <div class="callout note">
+            <div class="callout-title">容器化</div>
+            <p>pi 提供 <code>containerization.md</code>，建议在容器里运行并只挂载工作目录。这是目前最实际的隔离手段：即使扩展或模型被诱导执行危险命令，破坏也被限制在挂载范围内。</p>
+          </div>
+
+          <h2 id="critique"><span class="h2-num">7.8</span>设计评价</h2>
+          <p>这是一套“平台化”的扩展模型：核心保持小，能力通过进程内钩子生长。优点是表达力极强——你几乎可以改变任何行为，而不必 fork；缺点是<strong>没有稳定的安全边界</strong>，且钩子顺序、错误语义、重载生命周期都需要学习。</p>
+          <p>与 MCP 相比，扩展更强大但更危险；与插件式沙箱相比，扩展更灵活但更难审计。pi 的选择与它的定位一致：面向愿意读源码、自己承担责任的开发者。读这套代码时，值得把“如果这是我写的权限钩子，它会在哪些情况下失效”作为练习。</p>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>技能与扩展的边界在哪里？什么时候应该用哪一个？</li>
+              <li><code>agent_end</code> 与 <code>agent_settled</code> 的差别是什么？扩展应该把清理逻辑放在哪个事件？</li>
+              <li>为什么 <code>tool_call</code> 处理器抛错会阻止工具执行，而其他事件不会？</li>
+              <li><code>exposure: "codemode"</code> 的工具会出现在系统提示里吗？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：TUI 差分渲染</span>
+            <span>Figure 7-1</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

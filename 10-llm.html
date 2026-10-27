@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · 大模型基础 — pi 源码之旅</title>
+<meta name="description" content="面向后端工程师的 LLM 基础：token、上下文窗口、采样、工具调用、推理模型、提示词缓存、结构化输出与成本。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">大模型基础</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 10 · foundations</div>
+            <h1>模型不是数据库，<br>是一个无状态的补全函数</h1>
+            <p class="lead">写 agent 不要求你会训练模型，但必须理解它的计费单位、上下文边界、采样参数和工具协议。这一章从“一次 HTTP 请求”讲起，把 pi 里那些看似神秘的字段放回它们真实的位置。</p>
+            <div class="meta-row">
+              <span>阅读约 36 分钟</span>
+              <span>含上下文预算演示</span>
+              <span>后端视角</span>
+            </div>
+          </header>
+
+          <h2 id="request"><span class="h2-num">10.1</span>一次调用到底发生了什么</h2>
+          <p>把 LLM API 想成一个纯函数：</p>
+          <pre class="plain-tree">response = model(messages, tools?, sampling?, stream?)</pre>
+          <p>它<strong>不记得</strong>上一次调用。所谓“对话”，是你每次把完整历史重新发过去。服务端可能做前缀缓存，但语义上仍然是无状态的。一次请求包含：</p>
+          <ul>
+            <li><strong>messages</strong>：system / user / assistant / tool 角色，内容可以是文本、图片、工具调用、工具结果。</li>
+            <li><strong>tools</strong>：一组 JSON Schema 描述的函数签名。模型不会执行它们，只会“请求调用”。</li>
+            <li><strong>sampling</strong>：temperature、top_p、max_tokens 等，控制输出分布与长度。</li>
+            <li><strong>stream</strong>：是否用 SSE 增量返回。coding agent 几乎总是开流式，否则首字延迟不可接受。</li>
+          </ul>
+
+          <p>响应也不是“一段字符串”，而是一串<strong>内容块</strong>：</p>
+          <pre class="plain-tree">assistant message
+├─ text block        "我先读一下 server.ts"
+├─ thinking block    （推理模型可选，可能加密/不可见）
+└─ tool_use block    { id, name: "read", input: { path: "src/server.ts" } }
+stop_reason: "tool_use"</pre>
+
+          <p>pi 的 <code>AssistantMessage</code> 就是把各家的这种结构归一化后的结果：<code>content: (TextContent | ThinkingContent | ToolCall)[]</code>，外加 <code>usage</code>、<code>stopReason</code>、<code>errorMessage</code>。provider 适配器的职责，就是在“厂商 JSON”和这组内部类型之间来回翻译。</p>
+
+          <div class="callout note">
+            <div class="callout-title">为什么 agent 框架都有一层“消息归一化”</div>
+            <p>Anthropic 的工具结果放在 <code>user</code> 消息的 <code>tool_result</code> 块里；OpenAI 用独立的 <code>role: "tool"</code> 消息加 <code>tool_call_id</code>；Google 用 <code>functionResponse</code> part。如果核心循环直接拼厂商格式，换模型就要改循环。pi 的做法是：核心只认内部 <code>Message</code>，适配器负责投影。</p>
+          </div>
+
+          <h2 id="tokens"><span class="h2-num">10.2</span>Token：计费与容量的共同单位</h2>
+          <p>模型不按字符处理文本，而按 token。一个 token 大约对应：</p>
+          <ul>
+            <li>英文：约 4 个字符，或 0.75 个单词；</li>
+            <li>中文：常见汉字约 1–2 个 token（取决于 tokenizer 与词表）；</li>
+            <li>代码：缩进、标点、常见标识符往往各占一个 token，实际密度比英文更低；</li>
+            <li>图片：按分辨率折算成视觉 token，可能上千。</li>
+          </ul>
+
+          <p>关键结论：<strong>字符数不是可靠的预算单位</strong>。pi 的 faux provider 用一个粗暴的估算做模拟：</p>
+
+          <div class="code-panel" data-file="packages/ai/src/providers/faux.ts" data-lang="ts" data-start="159" data-highlight="1-3">
+            <div class="code-head">
+              <span class="path">packages/ai/src/providers/faux.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+function estimateTokens(text: string): number {
+	return Math.ceil(text.length / 4);
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L159-161</b><span>只用于本地假 provider 的延迟/用量模拟，<strong>不是</strong>真实计费依据。真实 token 数由 provider 返回的 <code>usage</code> 决定。</span></li>
+              <li><b>为什么是 /4</b><span>英文文本的经验平均值。对中文、代码、JSON 会显著低估，所以不能拿它做压缩阈值判断。</span></li>
+            </ul>
+          </div>
+
+          <p>pi 的 <code>Usage</code> 把账单拆得很细，因为它直接影响成本优化：</p>
+
+          <div class="code-panel" data-file="packages/ai/src/types.ts" data-lang="ts" data-start="459" data-highlight="2-5,13,27">
+            <div class="code-head">
+              <span class="path">packages/ai/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export interface Usage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Subset of `cacheWrite` written with 1h retention. Only Anthropic reports this split. */
+	cacheWrite1h?: number;
+	/**
+	 * Reasoning/thinking tokens, when the provider reports them. This is a subset of
+	 * `output`: `output` already includes these tokens. Set to a number (possibly 0) by
+	 * providers that expose a reasoning breakdown; left undefined by providers that don't.
+	 */
+	reasoning?: number;
+	totalTokens: number;
+	cost: {
+		/** Catalog-derived input cost. */
+		input: number;
+		/** Catalog-derived output cost. */
+		output: number;
+		/** Catalog-derived cache-read cost. */
+		cacheRead: number;
+		/** Catalog-derived cache-write cost. */
+		cacheWrite: number;
+		/** Best available total: provider-reported billed cost when supported, otherwise the catalog estimate. */
+		total: number;
+		/** True when `total` is the billed cost reported by the provider. False when it is a catalog estimate; absent also means false. */
+		totalFromProvider?: boolean;
+	};
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L460-463</b><span>普通输入、普通输出、缓存命中读、缓存写入分开计。它们的单价可能相差 10 倍以上。</span></li>
+              <li><b>L471</b><span><code>reasoning</code> 是 <code>output</code> 的<strong>子集</strong>，不是额外项。很多账单只按 output 计，思考 token 已经包含在内。</span></li>
+              <li><b>L485</b><span><code>totalFromProvider</code> 区分“厂商报的实账单”与“本地按价目表估算”。两者可能因折扣/阶梯价而不一致。</span></li>
+            </ul>
+          </div>
+
+          <p>成本计算的实现值得一读，因为它处理了两件容易错的事——<strong>阶梯价</strong>与<strong>长缓存写入的倍率</strong>：</p>
+
+          <div class="code-panel" data-file="packages/ai/src/models.ts" data-lang="ts" data-start="1236" data-highlight="2-11,14-18,20-22">
+            <div class="code-head">
+              <span class="path">packages/ai/src/models.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export function calculateCost(model: AnyModel, usage: Usage): Usage["cost"] {
+	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	let rates: ModelCostRates = model.cost;
+	let matchedThreshold = -1;
+	for (const tier of model.cost.tiers ?? []) {
+		if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
+			rates = tier;
+			matchedThreshold = tier.inputTokensAbove;
+		}
+	}
+
+	// Anthropic charges 2x base input for 1h cache writes.
+	const longWrite = usage.cacheWrite1h ?? 0;
+	const shortWrite = usage.cacheWrite - longWrite;
+	usage.cost.input = (rates.input / 1000000) * usage.input;
+	usage.cost.output = (rates.output / 1000000) * usage.output;
+	usage.cost.cacheRead = (rates.cacheRead / 1000000) * usage.cacheRead;
+	usage.cost.cacheWrite = (rates.cacheWrite * shortWrite + rates.input * 2 * longWrite) / 1000000;
+	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	usage.cost.totalFromProvider = false;
+	return usage.cost;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L1237</b><span>阶梯价按“总输入量”选档：缓存读与写也计入，因为它们同样占用模型输入。</span></li>
+              <li><b>L1241-1247</b><span>遍历所有 tier，取满足条件的最高阈值，而不是遇到第一个就停。价目表可以乱序。</span></li>
+              <li><b>L1254</b><span>1 小时缓存写入按基础输入价 2 倍计；短缓存写入用 <code>cacheWrite</code> 单价。把 <code>cacheWrite1h</code> 从总量里拆出来，避免重复计费。</span></li>
+              <li><b>L1256</b><span>单价单位是“每百万 token”，所以除以 <code>1_000_000</code>。这是最常见的 1000 倍错误来源。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="context"><span class="h2-num">10.3</span>上下文窗口：输入 + 输出的总预算</h2>
+          <p><code>contextWindow</code> 不是“历史消息的长度”，而是<strong>本次请求的输入 token + 期望输出 token 的上限</strong>。pi 的 <code>Model</code> 把它和 <code>maxTokens</code> 分开：</p>
+
+          <div class="code-panel" data-file="packages/ai/src/types.ts" data-lang="ts" data-start="854" data-highlight="8,16-18,19">
+            <div class="code-head">
+              <span class="path">packages/ai/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export interface Model<TApi extends Api> extends BaseModel<TApi> {
+	/**
+	 * Optional: chat is the default model type, so models without `type` are chat
+	 * models. Narrow mixed model lists with `isModelType()` instead of comparing
+	 * `type` directly.
+	 */
+	type?: "chat";
+	reasoning: boolean;
+	/**
+	 * Maps pi thinking levels to provider/model-specific values.
+	 * Missing keys use provider defaults. null marks a level as unsupported.
+	 */
+	thinkingLevelMap?: ThinkingLevelMap;
+	/** Prompt cache lifetimes per retention tier. Unset when the provider's cache behavior is unknown. */
+	promptCache?: ModelPromptCache;
+	contextWindow: number;
+	maxTokens: number;
+	/** Default sampling parameters for this model. See {@link StreamOptions.samplingParams}; per-request keys override these. */
+	samplingParams?: SamplingParams;
+            </script>
+            <ul class="code-notes">
+              <li><b>L861</b><span><code>reasoning</code> 标记是否支持思考；它决定 UI 是否显示 thinking 块、是否允许设置 thinking level。</span></li>
+              <li><b>L869</b><span><code>contextWindow</code> 是模型的总窗口，来自模型目录，不因请求而变。</span></li>
+              <li><b>L870</b><span><code>maxTokens</code> 是单次<strong>输出</strong>上限。真正可用于输入的上限约为 <code>contextWindow - maxTokens</code>。</span></li>
+              <li><b>L872</b><span>模型的默认采样参数放在这里；单次请求可以覆盖。这样“模型推荐配置”与“调用方意图”分开。</span></li>
+            </ul>
+          </div>
+
+          <p>为什么编码 agent 特别容易撞墙？因为上下文里不只有对话：</p>
+          <ul>
+            <li><strong>系统提示</strong>：工具说明、行为准则、项目上下文，常见 5–15k token；</li>
+            <li><strong>工具 schema</strong>：每个工具的 JSON Schema，十几个工具就是几千 token；</li>
+            <li><strong>工具结果</strong>：读一个文件可能 2k token，跑一次测试可能 10k；</li>
+            <li><strong>历史轮次</strong>：每一轮都保留之前的全部内容，线性增长；</li>
+            <li><strong>输出预留</strong>：必须给模型留出回答空间，否则会被截断。</li>
+          </ul>
+
+          <p>“lost in the middle” 是另一个约束：即使内容在窗口内，模型对开头和结尾的注意力也强于中段。所以 pi 把<strong>系统提示与当前任务放在两端</strong>，把大量工具结果放在中间，并用压缩把中段控制在可管理范围。</p>
+
+          <h2 id="sampling"><span class="h2-num">10.4</span>采样参数：控制分布，不控制事实</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>参数</th><th>作用</th><th>agent 场景的建议</th></tr></thead>
+              <tbody>
+                <tr><td><code>temperature</code></td><td>缩放 logits，越低越确定</td><td>工具调用/代码编辑用低值（0–0.3）；创意写作可高。</td></tr>
+                <tr><td><code>top_p</code></td><td> nucleus sampling，只保留累计概率前 p 的 token</td><td>通常与 temperature 二选一调整，不要同时大幅改。</td></tr>
+                <tr><td><code>top_k</code></td><td>只保留概率最高的 k 个 token</td><td>部分 provider 支持；对代码任务可收紧。</td></tr>
+                <tr><td><code>max_tokens</code></td><td>输出长度硬上限</td><td>必须小于窗口余量；太小会截断工具调用 JSON。</td></tr>
+                <tr><td><code>stop</code></td><td>遇到指定序列停止</td><td>agent 很少用；容易与代码内容冲突。</td></tr>
+                <tr><td><code>seed</code></td><td>尽量可复现</td><td>仅部分 provider 支持，不保证跨版本一致。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>pi 把这些放进 <code>SamplingParams</code>，并允许按 thinking level 覆盖（<code>samplingParamsByThinkingLevel</code>）。原因是推理模型在不同思考档位下推荐的温度不同；把“模型推荐值”与“用户覆盖值”分层，比在调用处硬编码更可维护。</p>
+          <div class="callout warn">
+            <div class="callout-title">temperature = 0 不等于确定性</div>
+            <p>浮点运算、批处理顺序、GPU 非确定性都会让同一请求产生不同结果。它只是“尽量选高概率 token”。不要在此基础上构建“重放必得同一答案”的测试；要测行为，就断言结构或不变量。</p>
+          </div>
+
+          <h2 id="tools"><span class="h2-num">10.5</span>工具调用：模型只出“意图”，执行永远在你这边</h2>
+          <p>工具调用不是 RPC。模型输出的是一个结构化请求：</p>
+          <pre class="plain-tree">{
+  "type": "tool_use",
+  "id": "toolu_01ABC",
+  "name": "read",
+  "input": { "path": "src/server.ts", "limit": 120 }
+}</pre>
+          <p>你的运行时负责：查工具 → 校验参数 → 执行 → 把结果作为一条新消息追加 → 再次请求模型。这个闭环就是 agent loop 的核心。几个容易踩的坑：</p>
+          <ul>
+            <li><strong>id 必须原样回传</strong>。并行调用时，结果靠 id 与请求配对；顺序错了，模型会看到“读 A 的结果”挂在“读 B”下面。</li>
+            <li><strong>参数是模型生成的，不可信</strong>。必须用 JSON Schema 校验，并做路径/命令层面的安全检查。</li>
+            <li><strong>工具结果也是输入 token</strong>。返回 10 万行日志，下一轮就可能超窗；pi 的 read/bash 因此有截断。</li>
+            <li><strong>模型可以“假装”调用不存在的工具</strong>。运行时必须返回结构化错误，而不是崩溃。</li>
+          </ul>
+          <p>流式场景更麻烦：工具调用的 JSON 是逐字符到达的，必须增量解析才能尽早显示“正在读取文件…”。pi 的 <code>streaming-json.ts</code> 就是为此写的部分 JSON 解析器；它在 <code>toolcall_delta</code> 阶段尽可能提取已完整的字段，在 <code>toolcall_end</code> 时做最终校验。</p>
+
+          <h2 id="reasoning"><span class="h2-num">10.6</span>推理模型：思考是输出的一部分</h2>
+          <p>推理模型在给出最终答案前会生成一段“思考”。对不同 provider，这段内容可能是：</p>
+          <ul>
+            <li><strong>可见的 thinking 块</strong>（Anthropic 的 extended thinking，可带签名）；</li>
+            <li><strong>摘要</strong>（只返回思考摘要，原文不暴露）；</li>
+            <li><strong>不可见但计费</strong>（reasoning tokens 计入 output）；</li>
+            <li><strong>加密/需回传</strong>（多轮工具调用时必须把加密推理块原样带回，否则模型丢失上下文）。</li>
+          </ul>
+          <p>pi 用 <code>thinkingLevelMap</code> 把统一的档位（off/minimal/low/medium/high/xhigh/max）映射到各家的具体参数；<code>null</code> 表示该档位不支持。这样上层只需要说“这次用 high”，不必知道 Anthropic 是 budget_tokens、OpenAI 是 reasoning.effort。</p>
+          <div class="callout tip">
+            <div class="callout-title">成本直觉</div>
+            <p>思考 token 按 output 计费，而 output 单价通常是 input 的 3–8 倍。一个“想 30 秒”的请求，账单可能主要来自思考而不是回答。对简单任务强行拉高档位，是最常见的浪费。</p>
+          </div>
+
+          <h2 id="cache"><span class="h2-num">10.7</span>提示词缓存：把稳定前缀变成折扣</h2>
+          <p>多数 provider 支持前缀缓存：如果本次请求的开头与上次<strong>逐 token 相同</strong>，这部分可以按缓存价读取（通常便宜 5–10 倍），写入则略贵。命中条件是严格的前缀匹配，因此顺序至关重要：</p>
+
+          <div class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 230" role="img" aria-label="提示词缓存的前缀结构">
+                <defs>
+                  <marker id="c10" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <text class="dg-label" x="24" y="30">请求 A</text>
+                <rect class="dg-box-teal" x="24" y="44" width="150" height="46"></rect>
+                <text class="dg-sub" x="36" y="64">system prompt</text>
+                <text class="dg-sub" x="36" y="79">（稳定）</text>
+                <rect class="dg-box-teal" x="182" y="44" width="130" height="46"></rect>
+                <text class="dg-sub" x="194" y="64">tool schemas</text>
+                <text class="dg-sub" x="194" y="79">（稳定）</text>
+                <rect class="dg-box" x="320" y="44" width="170" height="46"></rect>
+                <text class="dg-sub" x="332" y="64">历史消息</text>
+                <text class="dg-sub" x="332" y="79">（增长）</text>
+                <rect class="dg-box-ochre" x="498" y="44" width="120" height="46"></rect>
+                <text class="dg-sub" x="510" y="64">新问题</text>
+                <text class="dg-sub" x="510" y="79">（变化）</text>
+
+                <text class="dg-label" x="24" y="128">请求 B</text>
+                <rect class="dg-box-teal" x="24" y="142" width="150" height="46"></rect>
+                <text class="dg-sub" x="36" y="162">system prompt</text>
+                <text class="dg-sub" x="36" y="177">（稳定）</text>
+                <rect class="dg-box-teal" x="182" y="142" width="130" height="46"></rect>
+                <text class="dg-sub" x="194" y="162">tool schemas</text>
+                <text class="dg-sub" x="194" y="177">（稳定）</text>
+                <rect class="dg-box" x="320" y="142" width="170" height="46"></rect>
+                <text class="dg-sub" x="332" y="162">历史消息</text>
+                <text class="dg-sub" x="332" y="177">（增长）</text>
+                <rect class="dg-box-ochre" x="498" y="142" width="120" height="46"></rect>
+                <text class="dg-sub" x="510" y="162">新问题</text>
+                <text class="dg-sub" x="510" y="177">（变化）</text>
+
+                <path class="dg-line" d="M174 67 H182" marker-end="url(#c10)"></path>
+                <path class="dg-line" d="M312 67 H320" marker-end="url(#c10)"></path>
+                <path class="dg-line" d="M174 165 H182" marker-end="url(#c10)"></path>
+                <path class="dg-line" d="M312 165 H320" marker-end="url(#c10)"></path>
+                <rect x="24" y="108" width="594" height="12" fill="none"></rect>
+                <text class="dg-sub" x="626" y="70">← 可缓存前缀</text>
+                <text class="dg-sub" x="626" y="168">← 同一前缀</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 10-1</b> 缓存命中的是“从头开始的一段连续前缀”。一旦 system prompt 或工具列表变化，后面的历史即使没变也无法复用。</figcaption>
+          </div>
+
+          <p>这解释了两个设计选择：</p>
+          <ol>
+            <li><strong>为什么 pi 把工具声明折进 system 消息</strong>：单一稳定前缀，顺序确定，便于缓存。</li>
+            <li><strong>为什么系统提示要做“分段 diff”</strong>：只有变化的段落及其之后的内容失效，前面仍可命中。频繁改动开头的日期/时间会毁掉整个缓存。</li>
+          </ol>
+
+          <p>Anthropic 还区分 5 分钟与 1 小时缓存：写入更贵，但适合长任务。pi 的 <code>Usage.cacheWrite1h</code> 与 <code>Model.promptCache</code> 就是为这个差异准备的；计费时 1h 写入按 2 倍输入价（见 10.2 的代码）。</p>
+
+          <h2 id="structured"><span class="h2-num">10.8</span>结构化输出：约束解码与“事后校验”</h2>
+          <p>让模型稳定返回 JSON 有三条路：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>方式</th><th>机制</th><th>可靠性</th></tr></thead>
+              <tbody>
+                <tr><td>提示词要求</td><td>“只返回 JSON”</td><td>最弱；可能带 markdown 围栏或解释。</td></tr>
+                <tr><td>JSON mode</td><td>服务端约束输出必须是合法 JSON</td><td>中；不保证符合你的 schema。</td></tr>
+                <tr><td>Schema 约束解码</td><td>按 JSON Schema/grammar 限制每个 token</td><td>强；但支持度因 provider 而异，复杂 schema 可能降速。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>pi 的工具参数采用“schema + 运行时校验”的组合：schema 发给 provider 争取约束解码，返回后仍用 TypeBox/Valibot 校验。原因是不同 provider 对 schema 的支持不完整（可选字段、union、嵌套 $ref 都可能被简化），不能把正确性完全托付给模型。</p>
+
+          <h2 id="providers"><span class="h2-num">10.9</span>Provider 差异：同一概念，不同形状</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>概念</th><th>Anthropic</th><th>OpenAI</th><th>Google</th></tr></thead>
+              <tbody>
+                <tr><td>系统提示</td><td>顶层 <code>system</code></td><td><code>developer</code>/<code>system</code> 消息</td><td><code>systemInstruction</code></td></tr>
+                <tr><td>工具结果</td><td>user 消息里的 <code>tool_result</code> 块</td><td><code>role: "tool"</code> + <code>tool_call_id</code></td><td><code>functionResponse</code> part</td></tr>
+                <tr><td>并行工具调用</td><td>一个 assistant 消息里多个 <code>tool_use</code></td><td>多个 <code>tool_calls</code></td><td>多个 <code>functionCall</code> part</td></tr>
+                <tr><td>流式增量</td><td>content_block_delta</td><td>response.output_text.delta 等事件</td><td>candidates/parts 增量</td></tr>
+                <tr><td>思考</td><td>thinking 块（可带签名）</td><td>reasoning summary / encrypted</td><td>thought part</td></tr>
+                <tr><td>缓存</td><td>显式 cache_control + 5m/1h</td><td>自动前缀缓存</td><td>显式/隐式缓存上下文</td></tr>
+                <tr><td>停止原因</td><td><code>end_turn</code>/<code>tool_use</code>/<code>max_tokens</code></td><td><code>stop</code>/<code>tool_calls</code>/<code>length</code></td><td><code>STOP</code>/<code>MAX_TOKENS</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>这就是 <code>pi-ai</code> 存在的理由：把上表的差异关在适配器里，让上层只面对 <code>Message</code>、<code>ToolCall</code>、<code>StopReason</code>、<code>Usage</code>。读源码时，如果你想理解某个奇怪的分支，先问“这是哪家 provider 的怪癖”。</p>
+
+          <h2 id="demo"><span class="h2-num">10.10</span>演示：上下文预算怎么被吃满</h2>
+          <p>拖动四条滑块，观察系统提示、工具 schema、历史、输出预留如何共同挤压 200k 窗口。越过“窗口 − 16k 预留”时，pi 会在下一轮前触发压缩。</p>
+
+          <div class="demo" data-demo="budget">
+            <div class="demo-head">
+              <span class="title">context budget · 200k window</span>
+              <span class="pill">拖动试试</span>
+            </div>
+            <div class="demo-body">
+              <div class="budget-bar" style="display:flex;height:34px;border-radius:4px;overflow:hidden;border:1px solid var(--rule);margin-bottom:14px"></div>
+              <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 18px;margin-bottom:12px">
+                <label style="font-size:12px;font-family:var(--mono)">system <input type="range" min="1" max="30" value="6" style="width:100%"></label>
+                <label style="font-size:12px;font-family:var(--mono)">tools <input type="range" min="1" max="40" value="14" style="width:100%"></label>
+                <label style="font-size:12px;font-family:var(--mono)">history <input type="range" min="1" max="180" value="60" style="width:100%"></label>
+                <label style="font-size:12px;font-family:var(--mono)">output reserve <input type="range" min="1" max="40" value="8" style="width:100%"></label>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px">
+                <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">total</span>
+                <span data-budget-total style="font-family:var(--mono);font-size:13px"></span>
+              </div>
+              <div class="demo-note" data-budget-warn></div>
+            </div>
+          </div>
+
+          <p>注意演示中的一个反直觉点：<strong>工具 schema 也是上下文</strong>。装 30 个扩展工具，可能在你还没说第一句话时就花掉 10k token。这也是 pi 的扩展工具默认“按需暴露”的原因之一。</p>
+
+          <h2 id="cost"><span class="h2-num">10.11</span>成本与延迟：三个可观测指标</h2>
+          <ul>
+            <li><strong>TTFT</strong>（time to first token）：用户感知的“卡不卡”。受输入长度、缓存命中、provider 负载影响。</li>
+            <li><strong>输出速度</strong>（tokens/s）：长回答的总时长主要由它决定。</li>
+            <li><strong>总 token</strong>：账单。输入通常占大头，尤其是多轮 agent。</li>
+          </ul>
+          <p>优化顺序通常是：先减少无效工具结果（截断、grep 代替全文件读）→ 提高缓存命中（稳定前缀）→ 降低思考档位 → 最后才考虑换更小的模型。直接换小模型往往先损失工具调用正确率，反而增加重试成本。</p>
+
+          <h2 id="critique"><span class="h2-num">10.12</span>设计评价与检查点</h2>
+          <p>pi 对模型层的抽象是“<strong>窄核心、宽适配</strong>”：核心只保留 agent 真正需要的概念（消息、工具调用、用量、停止原因），把 provider 的怪癖留在适配器。好处是上层稳定；代价是某些 provider 独有能力（例如特殊的缓存控制、原生结构化输出）需要额外的兼容字段才能透出。</p>
+          <p>对后端工程师来说，最重要的心态转变是：<strong>把模型当成一个昂贵、慢速、非确定、会犯格式错误的外部服务</strong>。所有分布式系统的老办法——超时、重试、幂等、校验、可观测性——在这里全部适用。</p>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>为什么 <code>contextWindow</code> 不能全部用于输入？<code>maxTokens</code> 起什么作用？</li>
+              <li>提示词缓存为什么对“前缀顺序”如此敏感？什么样的改动会让缓存全失效？</li>
+              <li>工具调用中，模型负责什么、运行时负责什么？id 为什么必须原样回传？</li>
+              <li><code>Usage.reasoning</code> 为什么是 output 的子集？这对成本估算意味着什么？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：Harness 设计</span>
+            <span>1 live demo</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

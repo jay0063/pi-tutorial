@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi 源码之旅 · 从 Agent Loop 到可扩展 Harness</title>
+<meta name="description" content="面向有经验后端程序员的 pi 源码精读教程：架构、Agent Loop、会话与上下文、TUI、扩展系统，以及 TypeScript、LLM、Harness 补充教程。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">导览</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <header class="hero">
+      <div class="hero-grid-bg"></div>
+      <div class="hero-inner">
+        <div>
+          <div class="hero-kicker">A source-first field guide</div>
+          <h1>把 <em>pi</em><br>拆开来看</h1>
+          <p class="hero-sub">一个 <strong>极简、可扩展的 coding agent harness</strong>。本教程沿着真实的调用栈，从 provider 适配器、agent loop、会话树，一路读到差分渲染的终端界面。为有经验的后端工程师而写。</p>
+          <div class="hero-cta">
+            <a class="btn btn-primary" href="01-architecture.html">开始阅读 →</a>
+            <a class="btn btn-ghost" href="12-hands-on.html">直接动手</a>
+          </div>
+          <div class="hero-meta">
+            <span>TYPE-SCRIPT / NODE 22+</span>
+            <span>7 PACKAGES</span>
+            <span>≈218K LOC</span>
+            <span><a href="https://github.com/earendil-works/pi" target="_blank" rel="noreferrer">github.com/earendil-works/pi ↗</a></span>
+          </div>
+        </div>
+
+        <div class="hero-figure">
+          <div class="loop-card">
+            <div class="loop-card-head">
+              <span>agent-loop.ts · live schematic</span>
+              <span class="dot-row"><i></i><i></i><i></i></span>
+            </div>
+            <svg class="loop-svg" id="hero-loop" viewBox="0 0 540 320" role="img" aria-label="pi agent loop 示意图">
+              <defs>
+                <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                  <path d="M0,0 L8,4 L0,8 z" fill="#4a5448"></path>
+                </marker>
+              </defs>
+              <rect class="node-box" x="26" y="30" width="114" height="54"></rect>
+              <text class="node-label" x="42" y="52">prompt</text>
+              <text class="node-sub" x="42" y="68">user message</text>
+
+              <rect class="node-box" x="206" y="30" width="126" height="54"></rect>
+              <text class="node-label" x="222" y="52">context</text>
+              <text class="node-sub" x="222" y="68">projection + tools</text>
+
+              <rect class="node-box" x="402" y="30" width="104" height="54"></rect>
+              <text class="node-label" x="418" y="52">LLM</text>
+              <text class="node-sub" x="418" y="68">stream</text>
+
+              <rect class="node-box" x="402" y="240" width="104" height="54"></rect>
+              <text class="node-label" x="418" y="262">tools</text>
+              <text class="node-sub" x="418" y="278">execute</text>
+
+              <rect class="node-box" x="206" y="240" width="126" height="54"></rect>
+              <text class="node-label" x="222" y="262">results</text>
+              <text class="node-sub" x="222" y="278">toolResult</text>
+
+              <path class="edge" data-edge="0" d="M140 57 H206" marker-end="url(#arrow)"></path>
+              <path class="edge" data-edge="1" d="M332 57 H402" marker-end="url(#arrow)"></path>
+              <path class="edge" data-edge="2" d="M454 84 V240" marker-end="url(#arrow)"></path>
+              <path class="edge" data-edge="3" d="M402 267 H332" marker-end="url(#arrow)"></path>
+              <path class="edge" data-edge="4" d="M206 267 V84" marker-end="url(#arrow)"></path>
+              <path class="edge" data-edge="5" d="M332 267 C 520 267 530 57 506 57" marker-end="url(#arrow)"></path>
+
+              <circle class="packet" cx="140" cy="57" r="3.2" style="opacity:0"></circle>
+
+              <text class="node-sub" x="145" y="47" fill="#6f7668">①</text>
+              <text class="node-sub" x="356" y="47" fill="#6f7668">②</text>
+              <text class="node-sub" x="462" y="170" fill="#6f7668">③</text>
+              <text class="node-sub" x="356" y="258" fill="#6f7668">④</text>
+              <text class="node-sub" x="180" y="188" fill="#6f7668">⑤</text>
+            </svg>
+            <div class="hero-log" id="hero-log"><span style="color:#7c8577">等待开始…</span></div>
+          </div>
+          <div class="btn-row" style="margin-top:10px">
+            <button class="btn btn-ghost btn-sm" data-hero-play type="button">▶ 播放循环</button>
+            <button class="btn btn-ghost btn-sm" data-hero-step type="button">单步</button>
+            <button class="btn btn-ghost btn-sm" data-hero-reset type="button">重置</button>
+          </div>
+          <div class="hero-caption">一个 turn = 一次 assistant 响应 + 它触发的全部工具调用</div>
+        </div>
+      </div>
+    </header>
+
+    <div class="stats-strip">
+      <div class="stats-inner">
+        <div class="stat"><b>7</b><span>public packages</span></div>
+        <div class="stat"><b>≈218k</b><span>TypeScript lines</span></div>
+        <div class="stat"><b>1,641</b><span>.ts files in repo</span></div>
+        <div class="stat"><b>1</b><span>core loop, many surfaces</span></div>
+      </div>
+    </div>
+
+    <section class="home-body">
+      <div class="home-inner">
+        <div class="section-intro reveal">
+          <div class="kicker">The short version</div>
+          <div>
+            <h2>pi 的核心赌注：把 harness 做薄</h2>
+            <p>“Harness” 是包在大模型外面的那层工程：拼上下文、发请求、执行工具、存会话、渲染界面。大多数产品的做法是把策略写死在 harness 里；pi 反过来，把策略尽量上移为<strong>扩展、技能、提示模板与设置</strong>，核心只保留一个足够通用的循环和一套清晰的事件与类型契约。</p>
+            <p>这使得 pi 的源码非常适合作为“agent 系统如何工作”的教材：分层干净，边界类型化，关键决策都有注释。读它，比读一个把所有东西揉进一个 <code>agent.ts</code> 的项目更能建立可迁移的心智模型。</p>
+          </div>
+        </div>
+
+        <div class="layer-stack reveal">
+          <div class="layer">
+            <div><h4>Surface</h4><span class="pkg">pi-coding-agent · modes</span></div>
+            <p>交互 TUI、print/JSON、RPC、SDK 四种外壳。共享同一个 AgentSession；差别只在输入输出。</p>
+          </div>
+          <div class="layer">
+            <div><h4>Harness</h4><span class="pkg">AgentSession · SessionManager</span></div>
+            <p>装配系统提示、工具、模型与扩展；把会话落成可分支的 JSONL 树；负责压缩、重试、队列。</p>
+          </div>
+          <div class="layer">
+            <div><h4>Runtime</h4><span class="pkg">pi-agent-core</span></div>
+            <p>纯 agent loop：流式 assistant、工具调用批处理、steering / follow-up、生命周期事件。</p>
+          </div>
+          <div class="layer">
+            <div><h4>Protocol</h4><span class="pkg">pi-ai · providers</span></div>
+            <p>统一 Model / Context / Message / AssistantMessageEvent；把十几种 provider 的差异关在适配器里。</p>
+          </div>
+        </div>
+
+        <div class="section-intro reveal" style="margin-top:64px">
+          <div class="kicker">Reading map</div>
+          <div>
+            <h2>十二站，从协议到产品</h2>
+            <p>每个章节都可以独立阅读，但按顺序会形成一条完整的因果链：为什么需要统一协议 → 循环如何运转 → 产品层如何装配 → 状态如何持久化 → 如何扩展与渲染。</p>
+          </div>
+        </div>
+
+        <div class="card-grid reveal">
+          <a class="card" href="01-architecture.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 01</span>
+            <h3>全景架构</h3>
+            <p>Monorepo 的依赖方向、一次 prompt 的完整生命周期、事件如何穿过四层。</p>
+            <span class="card-tag">先读这篇</span>
+          </a>
+          <a class="card" href="02-pi-ai.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 02</span>
+            <h3>统一模型层 pi-ai</h3>
+            <p>Model、Message、AssistantMessageEventStream；适配器模式与流式 JSON 的工具调用。</p>
+          </a>
+          <a class="card" href="03-agent-loop.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 03</span>
+            <h3>Agent Loop 深潜</h3>
+            <p>双层循环、工具流水线、并行批处理、steering 与 follow-up 的真实语义。</p>
+          </a>
+          <a class="card" href="04-agent-session.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 04</span>
+            <h3>AgentSession 与装配</h3>
+            <p>产品级 harness 如何拼提示、接管事件、做投影、压缩、重试与工具隔离。</p>
+          </a>
+          <a class="card" href="05-session-context.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 05</span>
+            <h3>会话树与上下文</h3>
+            <p>JSONL 的 id/parentId 树、active branch、compaction 边界与可编辑上下文。</p>
+          </a>
+          <a class="card" href="06-tools-interfaces.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 06</span>
+            <h3>工具与运行接口</h3>
+            <p>read/bash/edit/write 的设计取舍；print、JSON、RPC 与 SDK 如何复用同一内核。</p>
+          </a>
+          <a class="card" href="07-extensions.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 07</span>
+            <h3>扩展系统</h3>
+            <p>jiti 热加载、ExtensionAPI、事件钩子、技能与 Pi packages；进程内信任模型。</p>
+          </a>
+          <a class="card" href="08-tui.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 08</span>
+            <h3>TUI 差分渲染</h3>
+            <p>为什么终端 UI 要自己做布局与 diff；16ms 节流、视口、光标与 Kitty 图像。</p>
+          </a>
+          <a class="card" href="09-typescript.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 09</span>
+            <h3>TypeScript 精要</h3>
+            <p>用 pi 的代码讲透可辨识联合、泛型分发、async iterable、声明合并与 NodeNext。</p>
+          </a>
+          <a class="card" href="10-llm.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 10</span>
+            <h3>大模型基础</h3>
+            <p>token、上下文窗口、tool calling、reasoning、prompt cache 与多 provider 差异。</p>
+          </a>
+          <a class="card" href="11-harness.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 11</span>
+            <h3>Harness 设计</h3>
+            <p>从 pi 反推 harness 的设计空间：策略放在哪、状态怎么存、错误如何恢复。</p>
+          </a>
+          <a class="card" href="12-hands-on.html">
+            <span class="arrow">→</span><span class="num">CHAPTER 12</span>
+            <h3>实战与源码路线</h3>
+            <p>跑起来、写一个拦截危险命令的扩展、150 行实现迷你 agent、调试技巧。</p>
+            <span class="card-tag">动手</span>
+          </a>
+        </div>
+
+        <div class="section-intro reveal" style="margin-top:64px">
+          <div class="kicker">Three paths</div>
+          <div>
+            <h2>按你的目的选一条路</h2>
+          </div>
+        </div>
+        <div class="card-grid three reveal">
+          <div class="card" style="cursor:default">
+            <span class="num">PATH A · 架构师</span>
+            <h3>先建立全局</h3>
+            <p>01 → 02 → 03 → 04 → 05。重点看边界与状态，不纠结 TUI 细节。约 2 小时。</p>
+          </div>
+          <div class="card" style="cursor:default">
+            <span class="num">PATH B · 造轮子</span>
+            <h3>先跑通最小闭环</h3>
+            <p>12 的迷你 agent → 03 → 02 → 06。先写一遍，再回来看 pi 如何处理边界情况。约 3 小时。</p>
+          </div>
+          <div class="card" style="cursor:default">
+            <span class="num">PATH C · 扩展作者</span>
+            <h3>直接进入接口</h3>
+            <p>07 → 06 → 04 的扩展生命周期 → 09。边读边写一个扩展，再回补内部机制。约 2 小时。</p>
+          </div>
+        </div>
+
+        <div class="callout note reveal" style="margin-top:56px">
+          <div class="callout-title">关于这份教程的源码基线</div>
+          <p>所有代码引用、行号与行为描述基于 <code>earendil-works/pi</code> 的 <code>531340f</code>（2026-10-27，<code>@earendil-works/pi-coding-agent@1.4.0</code>）。pi 迭代很快，读到时若行号漂移，请以文件里的符号名为准。教程中的“设计评价”是分析，不代表项目官方立场。</p>
+        </div>
+
+        <div class="footer-note">
+          <span>pi 源码之旅 · 本地静态站点</span>
+          <span>建议用桌面浏览器阅读 · 支持日间/夜间</span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

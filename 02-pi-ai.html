@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · 统一模型层 pi-ai — pi 源码之旅</title>
+<meta name="description" content="pi-ai 的模型、消息、事件流协议、provider 适配器、流式工具参数解析与重试策略。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">统一模型层 pi-ai</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 02 · pi-ai</div>
+            <h1>把十几种模型<br>关进同一个协议</h1>
+            <p class="lead">pi-ai 是整座建筑的地基。它不执行工具，也不管会话；它只回答一个问题：<strong>如何用一套类型与事件流，描述所有 LLM 的请求与响应？</strong> 这一章拆开 <code>Model</code>、<code>Message</code>、<code>AssistantMessageEventStream</code> 和 provider 适配器。</p>
+            <div class="meta-row">
+              <span>阅读约 30 分钟</span>
+              <span>关键文件 5 个</span>
+              <span>代码：typebox / SSE</span>
+            </div>
+          </header>
+
+          <h2 id="why"><span class="h2-num">2.1</span>为什么需要一层统一 API</h2>
+          <p>不同厂商的接口在四个维度上互不兼容：</p>
+          <ul>
+            <li><strong>消息形状</strong>：OpenAI 用 <code>tool_calls</code> 数组，Anthropic 用 <code>tool_use</code> content block，Google 用 <code>functionCall</code> part。</li>
+            <li><strong>流式协议</strong>：SSE 事件名、增量粒度、结束标记都不一样；有的厂商在流里给 usage，有的只在最后给。</li>
+            <li><strong>推理内容</strong>：thinking / reasoning summary / encrypted reasoning 的字段和回放规则不同。</li>
+            <li><strong>工具参数</strong>：有的返回完整 JSON，有的逐字符流式输出；有的支持 strict schema，有的只支持 grammar。</li>
+          </ul>
+          <p>如果 agent loop 直接对接厂商 SDK，它会被这些差异污染，每加一个 provider 就要改循环。pi-ai 的策略是<strong>归一化到“消息 + 事件”</strong>：provider 适配器负责翻译，循环只认识统一协议。</p>
+
+          <div class="callout note">
+            <div class="callout-title">设计取舍</div>
+            <p>归一化不是免费的。pi 的类型里保留了 <code>textSignature</code>、<code>thoughtSignature</code>、<code>rawStopReason</code>、<code>compat</code> 等厂商特有字段。这说明它选择的是<strong>“统一主干 + 保留逃生舱”</strong>，而不是追求纯净的抽象。对生产系统来说，这是更现实的做法。</p>
+          </div>
+
+          <h2 id="model"><span class="h2-num">2.2</span>Model：一个数据对象，不是客户端</h2>
+          <p>pi 里的 <code>Model</code> 是一个纯数据描述：id、provider、api、baseUrl、成本、上下文窗口、是否支持 reasoning、输入模态、provider 兼容参数。它不持有 HTTP 客户端，也不持有 API key。</p>
+
+          <div class="code-panel" data-file="packages/ai/src/types.ts" data-lang="ts" data-start="854" data-highlight="1,8,13,16-17,19,23-34">
+            <div class="code-head">
+              <span class="path">packages/ai/src/types.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export interface Model<TApi extends Api> extends BaseModel<TApi> {
+	/**
+	 * Optional: chat is the default model type, so models without `type` are chat
+	 * models. Narrow mixed model lists with `isModelType()` instead of comparing
+	 * `type` directly.
+	 */
+	type?: "chat";
+	reasoning: boolean;
+	/**
+	 * Maps pi thinking levels to provider/model-specific values.
+	 * Missing keys use provider defaults. null marks a level as unsupported.
+	 */
+	thinkingLevelMap?: ThinkingLevelMap;
+	/** Prompt cache lifetimes per retention tier. Unset when the provider's cache behavior is unknown. */
+	promptCache?: ModelPromptCache;
+	contextWindow: number;
+	maxTokens: number;
+	/** Default sampling parameters for this model. See {@link StreamOptions.samplingParams}; per-request keys override these. */
+	samplingParams?: SamplingParams;
+	/** Sampling parameter overrides selected by the effective pi thinking level. */
+	samplingParamsByThinkingLevel?: SamplingParamsByThinkingLevel;
+	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
+	compat?: TApi extends "openai-completions"
+		? OpenAICompletionsCompat
+		: TApi extends "openai-responses" | "azure-openai-responses" | "openai-codex-responses"
+			? OpenAIResponsesCompat
+			: TApi extends "anthropic-messages"
+				? AnthropicMessagesCompat
+				: TApi extends "bedrock-converse-stream"
+					? BedrockCompat
+					: TApi extends "mistral-conversations"
+						? MistralConversationsCompat
+						: never;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L854</b><span><strong>泛型参数是 API 名，不是厂商名</strong>。一个厂商可以有多个 API 形态（例如 OpenAI 的 completions 与 responses）。</span></li>
+              <li><b>L866</b><span><code>thinkingLevelMap</code> 把统一的 <code>minimal…max</code> 映射到各家的预算或 effort 档位，不支持就标 <code>null</code>。</span></li>
+              <li><b>L869</b><span><code>contextWindow</code> 与 <code>maxTokens</code> 是 harness 做压缩、限额、溢出恢复的依据。</span></li>
+              <li><b>L876</b><span><code>compat</code> 是条件类型：模型所属 API 决定兼容参数形状。这是 TypeScript 在“多态数据”上的典型用法。</span></li>
+            </ul>
+          </div>
+
+          <p>模型目录由 <code>*.models.ts</code> 静态数据 + 运行时 catalog 组成。<code>Models</code> 是一个注册表：持有 provider、按 id 查模型、解析凭据、把请求分发给正确的 provider。</p>
+
+          <h2 id="messages"><span class="h2-num">2.3</span>Message：四种角色，一种可重放的历史</h2>
+          <p>pi 的消息联合类型只有四种角色：<code>system</code>、<code>user</code>、<code>assistant</code>、<code>toolResult</code>。assistant 的内容是块数组：text、thinking、toolCall。toolResult 通过 <code>toolCallId</code> 与调用关联。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>类型</th><th>关键字段</th><th>为什么这样设计</th></tr></thead>
+              <tbody>
+                <tr><td><code>SystemMessage</code></td><td><code>content</code>、<code>sections</code>、<code>toolsAdded</code> / <code>toolsRemoved</code></td><td>系统提示与工具声明都放在 transcript 里，可增量 patch、可重放。</td></tr>
+                <tr><td><code>UserMessage</code></td><td>text / image 内容数组</td><td>支持多模态与文件粘贴。</td></tr>
+                <tr><td><code>AssistantMessage</code></td><td><code>content[]</code>、<code>usage</code>、<code>stopReason</code>、<code>api/provider/model</code></td><td>记录“哪个模型、花了多少、为什么停”，可审计、可计费。</td></tr>
+                <tr><td><code>ToolResultMessage</code></td><td><code>toolCallId</code>、<code>content</code>、<code>isError</code>、<code>details</code></td><td>模型看到 content；UI 与程序调用者看 details；结构化结果不污染上下文。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>TranscriptContext：一个被品牌化的类型</h3>
+          <p>对外 API 接受宽松的 <code>Context</code>（可以带 <code>systemPrompt</code> 与 <code>tools</code> 快捷字段）；但 provider 只接受 <code>TranscriptContext</code>。后者带一个不可伪造的 unique symbol 品牌，只有 <code>normalizeContext()</code> 能生产。</p>
+
+          <div class="code-panel" data-file="packages/ai/src/utils/transcript.ts" data-lang="ts" data-start="25" data-highlight="7-9">
+            <div class="code-head">
+              <span class="path">packages/ai/src/utils/transcript.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+/**
+ * Fold `Context.systemPrompt` and `Context.tools` into a leading system message.
+ * This is the only entry point that produces a {@link TranscriptContext}; every
+ * provider-facing function expects the result.
+ */
+export function normalizeContext(context: Context): TranscriptContext {
+	const initialMessage = createInitialSystemMessage(context.systemPrompt, context.tools);
+	const messages = initialMessage ? [initialMessage, ...context.messages] : context.messages;
+	return { messages } as TranscriptContext;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L31</b><span>系统提示与工具定义被折进<strong>第一条 system 消息</strong>，而不是作为请求的旁路参数。这样它们也进入 transcript，能被持久化、重放、增量修改。</span></li>
+              <li><b>L33</b><span>品牌类型让“未经归一化的 Context”在编译期就无法传给 provider，避免运行时才暴露协议错误。</span></li>
+            </ul>
+          </div>
+
+          <p>这个设计带来一个不寻常但强大的能力：<strong>工具集可以随对话变化</strong>。后面的 <code>SystemMessage.toolsAdded/toolsRemoved</code> 记录增量；<code>getCurrentTools()</code> 顺序重放得到当前可用工具。对不支持“对话中途改工具”的 provider，适配器会折叠成一条前置 system 消息。</p>
+
+          <h2 id="events"><span class="h2-num">2.4</span>事件协议：一次响应的状态机</h2>
+          <p>所有 provider 的流最终都要变成同一组 <code>AssistantMessageEvent</code>。它描述的是“内容块的生命周期”，而不是 HTTP chunk：</p>
+
+          <figure class="figure reveal">
+            <div class="figure-frame">
+              <svg viewBox="0 0 760 300" role="img" aria-label="assistant 事件状态机">
+                <defs>
+                  <marker id="ev-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+                    <path d="M0,0 L8,4 L0,8 z" fill="var(--rule-strong)"></path>
+                  </marker>
+                </defs>
+                <rect class="dg-box-accent" x="24" y="118" width="84" height="42"></rect>
+                <text class="dg-label" x="46" y="144">start</text>
+
+                <rect class="dg-box" x="150" y="38" width="116" height="42"></rect>
+                <text class="dg-label" x="166" y="64">text_*</text>
+                <text class="dg-sub" x="166" y="86" opacity="0">.</text>
+
+                <rect class="dg-box" x="150" y="118" width="116" height="42"></rect>
+                <text class="dg-label" x="166" y="144">thinking_*</text>
+
+                <rect class="dg-box" x="150" y="198" width="116" height="42"></rect>
+                <text class="dg-label" x="166" y="224">toolcall_*</text>
+
+                <rect class="dg-box-teal" x="330" y="118" width="112" height="42"></rect>
+                <text class="dg-label" x="350" y="144">done</text>
+
+                <rect class="dg-box-ochre" x="330" y="212" width="112" height="42"></rect>
+                <text class="dg-label" x="350" y="238">error</text>
+
+                <path class="dg-line flow" d="M108 139 H150" marker-end="url(#ev-arrow)"></path>
+                <path class="dg-line flow" d="M266 59 C 300 59 300 130 330 136" marker-end="url(#ev-arrow)"></path>
+                <path class="dg-line flow" d="M266 139 H330" marker-end="url(#ev-arrow)"></path>
+                <path class="dg-line flow" d="M266 219 C 300 219 300 150 330 143" marker-end="url(#ev-arrow)"></path>
+                <path class="dg-line-dash" d="M108 160 C 108 240 260 240 330 230" marker-end="url(#ev-arrow)"></path>
+
+                <text class="dg-sub" x="114" y="254">setup 失败可直接 error</text>
+                <text class="dg-sub" x="282" y="102">块可交错</text>
+                <text class="dg-sub" x="450" y="142">终态 · message</text>
+                <text class="dg-sub" x="450" y="236">终态 · error message</text>
+
+                <rect class="dg-band" x="490" y="52" width="240" height="168"></rect>
+                <text class="dg-label" x="506" y="76">每个 delta 都带 partial</text>
+                <text class="dg-sub" x="506" y="96">partial 是“到目前为止的完整</text>
+                <text class="dg-sub" x="506" y="112">assistant 消息”，不是补丁。</text>
+                <text class="dg-sub" x="506" y="136">contentIndex 指向 content 数组；</text>
+                <text class="dg-sub" x="506" y="152">前端可直接增量重绘。</text>
+                <text class="dg-sub" x="506" y="180">done/error 之后不得再有事件。</text>
+                <text class="dg-sub" x="506" y="196">更新不得先于 start。</text>
+              </svg>
+            </div>
+            <figcaption class="figcap"><b>图 2-1</b> 事件按“块”组织。一次响应里 text 与 toolCall 可以交错出现；每个 <code>*_start</code> 对应一个 <code>*_end</code>。</figcaption>
+          </figure>
+
+          <p>这个协议的关键约束写在 <code>AssistantMessageEvent</code> 的注释里：</p>
+          <ul>
+            <li><code>start</code> 必须先于任何 update 或终态；</li>
+            <li><code>partial</code> 是共享的“实时对象”，文本块在 <code>*_start</code> 时为空，靠 <code>*_delta</code> 增长；</li>
+            <li>redacted thinking 可能在 start 时就是完整的，不发 delta；</li>
+            <li>工具参数在 <code>toolcall_start</code> 时是 provider 特定的，后续 <code>toolcall_delta</code> 才是增量 JSON。</li>
+          </ul>
+
+          <div class="demo" data-demo="stream">
+            <div class="demo-head">
+              <span class="title">流式事件模拟</span>
+              <span class="pill teal">AssistantMessageEvent</span>
+            </div>
+            <div class="demo-body">
+              <div class="stream-out"><span class="dim">等待请求…</span></div>
+              <div class="stream-meta"></div>
+              <div class="demo-controls">
+                <button class="btn btn-sm" data-stream-play type="button">▶ 播放流</button>
+                <button class="btn btn-sm" data-stream-reset type="button">重置</button>
+                <span class="demo-note" style="margin:0">注意：文本和工具参数都只是 delta，最终解析发生在 <code>toolcall_end</code>。</span>
+              </div>
+            </div>
+          </div>
+
+          <h2 id="eventstream"><span class="h2-num">2.5</span>EventStream：用 AsyncIterable 做背压友好的管道</h2>
+          <p>provider 适配器是“生产者”，agent loop 是“消费者”。两者通过 <code>EventStream</code> 解耦：生产者 <code>push</code>，消费者 <code>for await</code>。它同时暴露一个 <code>result()</code> Promise，让只想拿最终消息的调用者不必消费整个流。</p>
+
+          <div class="code-panel" data-file="packages/ai/src/utils/event-stream.ts" data-lang="ts" data-start="26" data-highlight="18-33,47-63">
+            <div class="code-head">
+              <span class="path">packages/ai/src/utils/event-stream.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export class EventStream<T, R = T> implements AsyncIterable<T> {
+	private queue = new FifoQueue<T>();
+	private waiting = new FifoQueue<(value: IteratorResult<T>) => void>();
+	protected done = false;
+	private finalResultPromise: Promise<R>;
+	private resolveFinalResult!: (result: R) => void;
+	private isComplete: (event: T) => boolean;
+	private extractResult: (event: T) => R;
+
+	constructor(isComplete: (event: T) => boolean, extractResult: (event: T) => R) {
+		this.isComplete = isComplete;
+		this.extractResult = extractResult;
+		this.finalResultPromise = new Promise((resolve) => {
+			this.resolveFinalResult = resolve;
+		});
+	}
+
+	push(event: T): void {
+		if (this.done) return;
+
+		if (this.isComplete(event)) {
+			this.done = true;
+			this.resolveFinalResult(this.extractResult(event));
+		}
+
+		// Deliver to waiting consumer or queue it
+		const waiter = this.waiting.dequeue();
+		if (waiter) {
+			waiter({ value: event, done: false });
+		} else {
+			this.queue.enqueue(event);
+		}
+	}
+
+	end(result?: R): void {
+		this.done = true;
+		if (result !== undefined) {
+			this.resolveFinalResult(result);
+		}
+		// Notify all waiting consumers that we're done
+		while (this.waiting.length > 0) {
+			const waiter = this.waiting.dequeue()!;
+			waiter({ value: undefined as any, done: true });
+		}
+	}
+
+	async *[Symbol.asyncIterator](): AsyncIterator<T> {
+		while (true) {
+			if (this.queue.length > 0) {
+				yield this.queue.dequeue()!;
+			} else if (this.done) {
+				return;
+			} else {
+				const result = await new Promise<IteratorResult<T>>((resolve) => this.waiting.enqueue(resolve));
+				if (result.done) return;
+				yield result.value;
+			}
+		}
+	}
+
+	result(): Promise<R> {
+		return this.finalResultPromise;
+	}
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L26</b><span><strong>两个 FIFO 队列</strong>：一个存事件，一个存等待中的消费者。push 时若有等待者就直接交付，否则入队；消费时若无事件就挂起。</span></li>
+              <li><b>L46</b><span><code>isComplete</code> 是注入的谓词。对 assistant 流，它检查 <code>done</code> / <code>error</code>；终止时顺手解析最终结果。</span></li>
+              <li><b>L72</b><span><code>async *</code> 生成器让调用方用 <code>for await</code> 消费，天然支持 <code>break</code> 与 <code>AbortSignal</code> 组合。</span></li>
+              <li><b>L86</b><span><code>result()</code> 让“只关心最终消息”的调用者可以忽略中间事件，而不会丢失终止信号。</span></li>
+            </ul>
+          </div>
+
+          <p>它不是严格意义上的背压（生产端不会因为消费慢而暂停），而是一个<strong>无界缓冲 + 等待者队列</strong>。在 agent 场景里这是合理的：token 流很小，消费端通常就是当前进程；真需要背压时，用 <code>AbortSignal</code> 取消更简单。</p>
+
+          <h2 id="providers"><span class="h2-num">2.6</span>Provider 适配器：统一契约，差异下沉</h2>
+          <p><code>Provider</code> 接口把“模型目录 + 认证 + 流 + 可选能力”打包在一起。<code>Models</code> 负责解析 auth、合并 headers、归一化 context，然后调用 <code>provider.streamSimple()</code>。适配器内部通常做四件事：</p>
+          <ol>
+            <li>把统一的 <code>Message[]</code> 转成厂商 payload（工具 schema、图片、system、cache 标记）。</li>
+            <li>发起请求，处理认证、超时、重试、代理。适配器通常把 SDK 自带重试关掉（<code>maxRetries: 0</code>），交给统一策略。</li>
+            <li>消费 SSE / WebSocket，把厂商事件翻译成 <code>AssistantMessageEvent</code>。</li>
+            <li>在终止时计算 usage、cost、stopReason，发出 <code>done</code> 或 <code>error</code>。</li>
+          </ol>
+
+          <div class="code-panel" data-file="packages/ai/src/api/anthropic-messages.ts" data-lang="ts" data-start="575" data-highlight="6-7,13-24,25-36" data-nolines>
+            <div class="code-head">
+              <span class="path">packages/ai/src/api/anthropic-messages.ts</span>
+              <span class="right"><span class="lang">ts · 结构示意</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
+	model: Model<"anthropic-messages">,
+	context: TranscriptContext,
+	options?: AnthropicOptions,
+): AssistantMessageEventStream => {
+	const stream = new AssistantMessageEventStream();
+	const normalizedContext = resolveTranscript(context, getAnthropicCompat(model).supportsMidConvoSystemMessages);
+	const currentTools = getCurrentTools(normalizedContext.messages);
+
+	(async () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api as Api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "pending",
+			timestamp: Date.now(),
+		};
+
+		try {
+			// ... create client, resolve auth, build params ...
+			stream.push({ type: "start", partial: output });
+			// ... consume provider events, push text_* / thinking_* / toolcall_* ...
+		} catch (error) {
+			// ... normalize error into output, push { type: "error", ... }
+		}
+	})();
+
+	return stream;
+};
+            </script>
+            <ul class="code-notes">
+              <li><b>L580</b><span><strong>同步返回流，异步执行请求</strong>。调用方立刻拿到 <code>AssistantMessageEventStream</code>，错误通过流事件而非 Promise rejection 传播。</span></li>
+              <li><b>L581-582</b><span>适配器先解析 transcript 的“有效形态”：是否需要把 system 消息折叠到开头，以及当前工具集。工具声明从 system 消息里重放得到。</span></li>
+              <li><b>L586</b><span><code>output</code> 是<strong>唯一可变的消息对象</strong>；所有 partial 都指向它。消费端必须把它当只读快照使用。</span></li>
+              <li><b>L602</b><span>先 push <code>start</code>，再消费 provider 流。协议要求任何 update 不得早于 start。</span></li>
+            </ul>
+          </div>
+
+          <h3>翻译 content block</h3>
+          <p>Anthropic 的流事件以 <code>content_block_start</code> / <code>content_block_delta</code> / <code>content_block_stop</code> 为单位。适配器把 block index 映射到 <code>output.content</code> 的下标，并为每个 tool_use 建一个增量 JSON 解析器。</p>
+
+          <div class="code-panel" data-file="packages/ai/src/api/anthropic-messages.ts" data-lang="ts" data-start="730" data-highlight="10-14,29-43">
+            <div class="code-head">
+              <span class="path">packages/ai/src/api/anthropic-messages.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+} else if (event.type === "content_block_start") {
+	if (event.content_block.type === "fallback") {
+		if (output.content.length > 0) {
+			throw new Error("Anthropic performed an unsupported mid-output model fallback");
+		}
+		continue;
+	}
+	if (event.content_block.type === "text") {
+		output.content.push({ type: "text", text: event.content_block.text ?? "" });
+		openBlocks.set(event.index, { contentIndex: output.content.length - 1 });
+		stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
+	} else if (event.content_block.type === "thinking") {
+		output.content.push({
+			type: "thinking",
+			thinking: event.content_block.thinking ?? "",
+			thinkingSignature: event.content_block.signature ?? "",
+		});
+		openBlocks.set(event.index, { contentIndex: output.content.length - 1 });
+		stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+	} else if (event.content_block.type === "redacted_thinking") {
+		output.content.push({
+			type: "thinking",
+			thinking: "[Reasoning redacted]",
+			thinkingSignature: event.content_block.data,
+			redacted: true,
+		});
+		openBlocks.set(event.index, { contentIndex: output.content.length - 1 });
+		stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
+	} else if (event.content_block.type === "tool_use") {
+		output.content.push({
+			type: "toolCall",
+			id: event.content_block.id,
+			name: isOAuth
+				? fromClaudeCodeName(event.content_block.name, currentTools)
+				: event.content_block.name,
+			arguments: (event.content_block.input as Record<string, any>) ?? {},
+		});
+		openBlocks.set(event.index, {
+			contentIndex: output.content.length - 1,
+			arguments: new ToolCallArgumentsStream(),
+		});
+		stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L737</b><span>文本块一开始可能是空的，真正的字符通过后续 <code>content_block_delta</code> 追加；<code>text_start</code> 先通知 UI 建块。</span></li>
+              <li><b>L758</b><span>工具调用块同样先占位，并绑定一个 <code>ToolCallArgumentsStream</code>。原始 JSON 文本不进 transcript，只在流状态里。</span></li>
+              <li><b>L763</b><span>OAuth（Claude Code 订阅）场景下工具名可能被重命名，需要映射回 pi 的工具名；这是“兼容层”在适配器里的典型痕迹。</span></li>
+            </ul>
+          </div>
+
+          <h3>流式工具参数：为什么不能直接 JSON.parse</h3>
+          <p>模型返回的 tool call 参数是逐段到达的。中途文本通常是非法 JSON：<code>{"path":"src/se</code>。适配器不能等流结束才更新 UI，因为工具调用的参数预览、权限确认都需要尽早展示。</p>
+          <p>pi 的 <code>StreamingJsonParser</code> 是一个容错的增量解析器：未闭合的字符串显示已读字符，未闭合的对象显示已有成员，非法转义保留为字面量，永远不抛异常。它还通过“复制信用”限制大对象快照的开销：<code>snapshot()</code> 可能返回旧快照，保证总工作量与输入长度线性相关。</p>
+
+          <div class="code-panel" data-file="packages/ai/src/utils/streaming-json.ts" data-lang="ts" data-start="127" data-highlight="1-12,20-29">
+            <div class="code-head">
+              <span class="path">packages/ai/src/utils/streaming-json.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+append(text: string): readonly JsonChange[] {
+	this.#credit += CREDIT_PER_APPEND + CREDIT_PER_CHARACTER * text.length;
+	this.#changes = [];
+	if (this.#string !== undefined) this.#string.change = undefined;
+	let index = 0;
+	while (index < text.length && !this.#done) {
+		const open = this.#string;
+		if (open !== undefined) index = this.#readString(open, text, index);
+		else if (this.#scalar !== "") index = this.#readScalar(text, index);
+		else this.#structural(text[index++]!);
+	}
+	return this.#changes;
+}
+
+	/**
+	 * The value of the text read so far: `undefined` before a value starts, otherwise a plain JSON value that never
+	 * changes afterwards. Returns the previous snapshot while the text read since did not change the value, or while a
+	 * fresh copy of the open path is not yet paid for (see the module comment).
+	 */
+	snapshot(): JsonValue | undefined {
+	if (!this.#dirty) return this.#snapshot;
+	const pending = this.#pendingScalar();
+	const cost = this.#pathCost + (pending === undefined ? 0 : 1);
+	if (cost > this.#credit) return this.#snapshot;
+	this.#credit -= cost;
+	this.#dirty = false;
+	this.#snapshot = this.#copyOpenPath(pending);
+	return this.#snapshot;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L127</b><span>单次扫描：每段文本只读一遍，字符串、标量、结构字符三种状态机。复杂度 O(输入长度)。</span></li>
+              <li><b>L146</b><span><strong>信用机制</strong>：不是每次 append 都重新拷贝整个开放容器；信用不够时返回上一个快照。大数组场景下 UI 预览会略微滞后，但总成本有上界。</span></li>
+              <li><b>L153</b><span>最终仍用 <code>parseToolCallArguments()</code> 完整解析一次；增量解析只用于预览，不能替代严格校验。</span></li>
+            </ul>
+          </div>
+
+          <p>最终，<code>AgentToolCall.arguments</code> 可能带着 <code>argumentsError</code>。agent loop 的参数校验会把这个错误变成模型可见的 toolResult，让它重试——这是“错误也是上下文”的一个具体例子。</p>
+
+          <h2 id="retry"><span class="h2-num">2.7</span>重试、成本与那些“不统一”的细节</h2>
+          <p>pi-ai 把 provider 错误分为可重试与不可重试两类，用一组正则匹配错误文本：429/5xx、overloaded、rate limit、连接中断、流提前结束等可重试；配额耗尽、账单问题、订阅限制不可重试。适配器默认关闭 SDK 自带重试（<code>maxRetries: 0</code>），避免两层重试叠加。</p>
+          <ul>
+            <li><strong>延迟上限</strong>：<code>maxRetryDelayMs</code> 默认 60s；服务端要求的等待超过上限就立即失败，交给上层带用户提示的重试。</li>
+            <li><strong>流中失败</strong>：已经 <code>start</code> 后出错，仍然通过 <code>error</code> 事件返回一个 <code>stopReason: "error"</code> 的 assistant 消息，而不是 reject Promise。</li>
+            <li><strong>成本</strong>：<code>calculateCost()</code> 支持阶梯定价、1h 缓存写入按 2× input 计费；usage 里保留 cacheRead/cacheWrite，方便分析 prompt cache 命中率。</li>
+            <li><strong>思考档位</strong>：统一为 <code>off/minimal/low/medium/high/xhigh/max</code>，由 <code>thinkingLevelMap</code> 映射；不支持的档位会被 clamp 到最近的可用档。</li>
+          </ul>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>API 标识</th><th>典型 provider</th><th>适配重点</th></tr></thead>
+              <tbody>
+                <tr><td><code>anthropic-messages</code></td><td>Anthropic、Claude Code OAuth、Bedrock 部分模型</td><td>content block、thinking 签名、cache_control、strict tools 降级</td></tr>
+                <tr><td><code>openai-responses</code></td><td>OpenAI、Azure、Codex</td><td>reasoning item 回放、function call、response id、deferred</td></tr>
+                <tr><td><code>openai-completions</code></td><td>OpenAI 兼容端点（DeepSeek、Groq、xAI…）</td><td>chat completions、自定义 sampling params、工具调用兼容</td></tr>
+                <tr><td><code>google-generative-ai</code></td><td>Google AI Studio / Gemini</td><td>function declarations、thought signature、多模态 part</td></tr>
+                <tr><td><code>google-vertex</code></td><td>GCP Vertex AI</td><td>ADC 认证、区域端点、与 Google 共享转换逻辑</td></tr>
+                <tr><td><code>bedrock-converse-stream</code></td><td>AWS Bedrock</td><td>SigV4、Smithy middleware、Converse 事件流</td></tr>
+                <tr><td><code>mistral-conversations</code></td><td>Mistral</td><td>conversation API、工具调用格式</td></tr>
+                <tr><td><code>pi-messages</code></td><td>pi 自有/代理端点</td><td>直接承载 pi 原生事件，减少转换损耗</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="critique"><span class="h2-num">2.8</span>这一层的代价与边界</h2>
+          <p>pi-ai 的设计很务实，但不是“零成本抽象”：</p>
+          <ul>
+            <li><strong>类型很大</strong>：<code>types.ts</code> 接近千行，包含大量可选字段。读的时候要区分“核心协议”和“厂商逃生舱”。</li>
+            <li><strong>事件顺序需要信任适配器</strong>：协议规定了顺序，但运行时没有强校验；一个写错的扩展 provider 可能发出非法序列。</li>
+            <li><strong>“simple” 与 “full” 双入口</strong>：<code>stream</code> 保留厂商选项，<code>streamSimple</code> 提供统一档位。简单场景用后者，复杂场景用前者。</li>
+            <li><strong>工具声明在 system 消息里</strong>：这是 pi 的特色，也让“中途换工具”成为可能；但要求 provider 支持 mid-conversation system，否则适配器要折叠。</li>
+          </ul>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>为什么 <code>normalizeContext()</code> 要返回一个带品牌类型的 <code>TranscriptContext</code>？</li>
+              <li><code>EventStream</code> 如何同时支持“逐事件消费”和“只取最终结果”？</li>
+              <li>工具参数为什么要用容错增量解析，而不是等流结束？</li>
+              <li>一个 provider 适配器最少要实现哪几步？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：Agent Loop 深潜</span>
+            <span>Figures 2-1 · live demo</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

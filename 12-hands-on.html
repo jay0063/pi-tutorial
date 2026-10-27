@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · 动手实践 — pi 源码之旅</title>
+<meta name="description" content="从安装 pi 到写第一个扩展、用 SDK 嵌入、按路线读源码，以及常见坑。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">动手实践</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 12 · hands-on</div>
+            <h1>跑起来，<br>然后改一行看结果</h1>
+            <p class="lead">读源码最好的方式是带着问题做实验。这一章给出最短的启动路径、一个可运行的自定义工具、SDK 嵌入示例，以及一条五天读完核心的路线。</p>
+            <div class="meta-row">
+              <span>阅读约 26 分钟</span>
+              <span>可直接运行</span>
+              <span>含练习</span>
+            </div>
+          </header>
+
+          <h2 id="setup"><span class="h2-num">12.1</span>准备环境</h2>
+          <p>要求 Node.js <strong>22.19 或更高</strong>。三种安装方式选一种：</p>
+
+          <div class="code-panel" data-file="README.md" data-lang="bash" data-start="27" data-highlight="1-3,6-8">
+            <div class="code-head">
+              <span class="path">README.md</span>
+              <span class="right"><span class="lang">bash</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+# macOS / Linux 安装脚本（会固定依赖版本）
+curl -fsSL https://pi.dev/install.sh | sh
+
+# 或者用 npm（不固定传递依赖）
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+# Windows PowerShell
+powershell -c "irm https://pi.dev/install.ps1 | iex"
+            </script>
+            <ul class="code-notes">
+              <li><b>L28</b><span>安装脚本会同时处理 Node 版本与依赖锁定，升级用 <code>pi update</code>。</span></li>
+              <li><b>L31</b><span><code>--ignore-scripts</code> 是 pi 明确推荐的：正常安装不需要依赖的生命周期脚本，能减少供应链风险。</span></li>
+              <li><b>L34</b><span>Windows 安装脚本同样会检查 Node 版本。若你已用 nvm/fnm，确认当前 shell 的 Node ≥ 22.19。</span></li>
+            </ul>
+          </div>
+
+          <p>然后进入你想让它工作的目录，启动：</p>
+          <div class="code-panel" data-file="README.md" data-lang="bash" data-start="38" data-highlight="1-2">
+            <div class="code-head">
+              <span class="path">README.md</span>
+              <span class="right"><span class="lang">bash</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+cd /path/to/project
+pi
+            </script>
+            <ul class="code-notes">
+              <li><b>L38-39</b><span>pi 以<strong>当前目录</strong>为工作区：项目上下文、工具路径、会话分组都基于它。不要在主目录随便启动。</span></li>
+            </ul>
+          </div>
+
+          <p>首次使用需要接一个 provider。在 pi 里运行 <code>/login</code>，按提示选择订阅或 API key；<code>/logout</code> 退出。<code>/model</code>（或 <code>Ctrl+L</code>）切换模型。</p>
+
+          <h2 id="first"><span class="h2-num">12.2</span>第一次会话：观察而不是背命令</h2>
+          <p>给一个具体、可验证的任务，例如：</p>
+          <pre class="plain-tree">读一下 src/server.ts，给 /healthz 加一个健康检查接口，
+并补一个测试。改完运行测试。</pre>
+          <p>你会看到 pi 的典型工作流：</p>
+          <ol>
+            <li>先读文件/搜索，而不是直接改；</li>
+            <li>调用 edit/write，工具结果回到上下文；</li>
+            <li>运行测试，失败则继续修；</li>
+            <li>最后给一个简短总结。</li>
+          </ol>
+          <p>常用交互：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>操作</th><th>作用</th></tr></thead>
+              <tbody>
+                <tr><td><code>/model</code> · <code>Ctrl+L</code></td><td>切换模型与思考档位。</td></tr>
+                <tr><td><code>/compact</code></td><td>把历史压缩成摘要，释放上下文。</td></tr>
+                <tr><td><code>/tree</code> · <code>/fork</code> · <code>/clone</code></td><td>查看/切换分支，探索另一条路线而不丢失原工作。</td></tr>
+                <tr><td><code>!</code> 开头</td><td>直接运行终端命令，不经过模型。</td></tr>
+                <tr><td><code>Ctrl-C</code></td><td>中止当前运行；会话保留。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="callout tip">
+            <div class="callout-title">实验：故意让它失败</div>
+            <p>让它改一个不存在的文件，观察工具错误如何以 <code>isError</code> 结果回到模型，以及模型如何自己纠正路径。这比读十遍 loop 代码更能理解“工具错误是上下文的一部分”。</p>
+          </div>
+
+          <h2 id="extension"><span class="h2-num">12.3</span>写第一个扩展：一个自定义工具</h2>
+          <p>扩展是一个导出默认工厂的 TypeScript 模块。下面这个例子完整、可运行，来自仓库的 <code>examples/extensions/hello.ts</code>：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/examples/extensions/hello.ts" data-lang="ts" data-start="1" data-highlight="5-6,8-14,16-21,24-26">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/examples/extensions/hello.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+/**
+ * Hello Tool - Minimal custom tool example
+ */
+
+import { Type } from "@earendil-works/pi-ai";
+import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+const helloTool = defineTool({
+	name: "hello",
+	label: "Hello",
+	description: "A simple greeting tool",
+	parameters: Type.Object({
+		name: Type.String({ description: "Name to greet" }),
+	}),
+
+	async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		return {
+			content: [{ type: "text", text: `Hello, ${params.name}!` }],
+			details: { greeted: params.name },
+		};
+	},
+});
+
+export default function (pi: ExtensionAPI) {
+	pi.registerTool(helloTool);
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L5-6</b><span>TypeBox 提供运行时 schema；<code>defineTool</code> 保留参数类型推断，避免 <code>params</code> 退化成 <code>unknown</code>。</span></li>
+              <li><b>L8-14</b><span><code>name</code> 是模型看到的函数名；<code>description</code> 是模型决定是否调用的主要依据，写清楚“什么时候用”比写实现细节更重要。</span></li>
+              <li><b>L16-21</b><span><code>content</code> 是给模型看的文本；<code>details</code> 是给 UI/扩展用的结构化数据，不进入模型上下文。分开两者可以避免把调试信息塞进 token。</span></li>
+              <li><b>L24-26</b><span>工厂在加载时执行一次；<code>registerTool</code> 必须在这里调用。不要在工厂里启动进程或定时器（见 12.8）。</span></li>
+            </ul>
+          </div>
+
+          <p>把它放到用户扩展目录，或直接用命令行加载：</p>
+          <pre class="plain-tree"># 方式一：放到 ~/.pi/agent/extensions/hello.ts，重启 pi
+# 方式二：开发时直接指定
+pi --extension ./hello.ts</pre>
+          <p>然后对 pi 说“用 hello 工具跟 Ada 打个招呼”。模型会调用 <code>hello({ name: "Ada" })</code>，你会在终端看到工具卡片和返回文本。</p>
+
+          <h3>加一条安全规则</h3>
+          <p>工具不一定要“做事”，也可以“阻止做事”。在扩展里监听 <code>tool_call</code>，检查参数并返回 block：</p>
+          <pre class="plain-tree">pi.on("tool_call", (event, ctx) => {
+  if (event.toolName !== "bash") return;
+  const cmd = String(event.input.command ?? "");
+  if (/\brm\s+-rf\b/.test(cmd)) {
+    return { block: true, reason: "rm -rf is not allowed in this project" };
+  }
+});</pre>
+          <p>这条规则会<strong>失败关闭</strong>：只要扩展明确 block，工具就不会执行。注意 <code>tool_call</code> 处理器抛异常也会阻止工具（第 07 章讲过这个例外），所以规则本身要尽量简单、可预测。</p>
+
+          <h2 id="sdk"><span class="h2-num">12.4</span>用 SDK 把 pi 嵌进你的程序</h2>
+          <p>如果你的宿主是 Node 进程，不需要解析终端输出，直接用 <code>createAgentSession()</code>。最小示例：</p>
+
+          <div class="code-panel" data-file="packages/coding-agent/examples/sdk/01-minimal.ts" data-lang="ts" data-start="8" data-highlight="3,5-9,12-14,17-19">
+            <div class="code-head">
+              <span class="path">packages/coding-agent/examples/sdk/01-minimal.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+import { createAgentSession } from "@earendil-works/pi-coding-agent";
+
+const { session } = await createAgentSession();
+
+try {
+	session.subscribe((event) => {
+		if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+			process.stdout.write(event.assistantMessageEvent.delta);
+		}
+	});
+
+	await session.prompt("What files are in the current directory?");
+	session.state.messages.forEach((msg) => {
+		console.log(msg);
+	});
+	console.log();
+} finally {
+	session.dispose();
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L10</b><span>默认使用当前目录、已发现的扩展/技能/工具、已保存的设置与凭证。想隔离就传 <code>SessionManager.inMemory()</code> 与显式 <code>cwd</code>。</span></li>
+              <li><b>L13-17</b><span><strong>先订阅再 prompt</strong>，否则会漏掉开头的流式事件。只处理 <code>text_delta</code>；工具调用、压缩、重试各有事件类型。</span></li>
+              <li><b>L19</b><span><code>prompt()</code> 在整次 run 结束后才 resolve，包括自动重试。它不是“发出去就返回”。</span></li>
+              <li><b>L25</b><span><code>dispose()</code> 中止活动任务、注销扩展、断开监听。忘掉它会泄漏进程资源。</span></li>
+            </ul>
+          </div>
+
+          <p>几个常用配置：</p>
+          <pre class="plain-tree">const { session } = await createAgentSession({
+  cwd: "/path/to/project",
+  tools: ["read", "grep", "find", "ls"],       // 只读模式
+  sessionManager: SessionManager.inMemory(),   // 不落盘
+  thinkingLevel: "high",
+});</pre>
+          <p>如果宿主需要“运行结束后绝不再自动继续”的信号，用 <code>agent_settled</code>，而不是 <code>agent_end</code>。后者只表示一次低层 run 结束，之后还可能因重试、压缩、排队消息继续。</p>
+
+          <h2 id="route"><span class="h2-num">12.5</span>五天读源码路线</h2>
+          <p>不要从 <code>coding-agent/src</code> 的第一行开始读。按依赖倒序，每天一个主题，每个主题配一个可验证的问题：</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>天</th><th>读什么</th><th>带着什么问题</th><th>验证方式</th></tr></thead>
+              <tbody>
+                <tr><td>1</td><td><code>packages/ai/src/types.ts</code>、<code>utils/event-stream.ts</code>、一个 provider 适配器</td><td>一条流式响应如何变成事件？<code>result()</code> 与迭代器如何共存？</td><td>写一个小脚本消费 <code>EventStream</code>，打印事件序列。</td></tr>
+                <tr><td>2</td><td><code>packages/agent/src/loop.ts</code>、<code>types.ts</code></td><td>内外两层循环各负责什么？并行工具结果如何保持顺序？</td><td>在 <code>prepareToolCall</code> 里加日志，观察一次双工具调用。</td></tr>
+                <tr><td>3</td><td><code>coding-agent/src/core/agent-session.ts</code></td><td>六个钩子分别改变什么？prompt 从输入到请求经过哪些阶段？</td><td>订阅事件，打印 <code>turn_start/turn_end/agent_end/agent_settled</code> 的顺序。</td></tr>
+                <tr><td>4</td><td><code>session-manager.ts</code>、<code>messages.ts</code>、<code>compaction</code> 相关文件</td><td>树如何投影成上下文？压缩后保留区从哪开始？</td><td>打开一个真实会话 JSONL，手算 <code>buildContextEntries</code> 的结果。</td></tr>
+                <tr><td>5</td><td><code>packages/tui/src</code>、<code>coding-agent/src/modes</code></td><td>一帧如何 diff？五种接口模式如何复用同一个 session？</td><td>用 <code>--mode json</code> 跑同一任务，对比交互模式的事件。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>每天结束前，写下三个“为什么这样设计”的答案。读不懂的地方，先看测试：<code>packages/*/test</code> 往往比实现更能说明契约。</p>
+
+          <h2 id="exercises"><span class="h2-num">12.6</span>三个练习</h2>
+
+          <h3>练习 1：成本哨兵</h3>
+          <p>写一个扩展，在每轮结束后读取本次运行的 <code>usage</code>，累计成本；超过阈值时用 <code>ctx.ui.notify()</code> 提醒，并在状态栏显示当前会话总花费。提示：成本字段已经在 <code>Usage.cost</code> 里算好，不要自己乘单价。</p>
+
+          <h3>练习 2：路径守卫</h3>
+          <p>监听 <code>tool_call</code>，对 <code>edit</code>/<code>write</code> 的参数做 <code>realpath</code> 解析，阻止写到工作区之外。注意符号链接与 <code>..</code>；比较时统一大小写（Windows）。这个练习会让你真正理解“工具参数不可信”。</p>
+
+          <h3>练习 3：上下文可视化</h3>
+          <p>订阅 <code>turn_start</code> 或上下文相关事件，按类别估算当前上下文体量：系统提示、工具结果、用户消息、assistant 消息。不需要精确 tokenizer，用字符数分桶即可；目标是看清“谁在吃窗口”。</p>
+
+          <div class="callout tip">
+            <div class="callout-title">调试扩展</div>
+            <p>扩展与 pi 同进程，<code>console.log</code> 可能被 TUI 覆盖。优先用 <code>ctx.ui.notify()</code> 或写文件日志；也可以用 <code>--mode json</code> 跑，让标准输出干净一些。</p>
+          </div>
+
+          <h2 id="pitfalls"><span class="h2-num">12.7</span>常见坑</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>现象</th><th>原因</th><th>处理</th></tr></thead>
+              <tbody>
+                <tr><td>扩展改了但没生效</td><td>jiti 禁用了模块缓存，但工厂只在加载时执行</td><td>重启 pi，或用扩展命令触发 reload；不要依赖模块级状态跨 reload。</td></tr>
+                <tr><td>工具调用参数是 <code>unknown</code></td><td>直接传对象字面量，上下文类型放宽了</td><td>用 <code>defineTool()</code> 包一层，保留 schema 推断。</td></tr>
+                <tr><td>模型看不到新工具</td><td>工具注册了但未激活</td><td>检查 <code>setActiveTools</code>/默认工具设置；工具声明在下次请求前才发给模型。</td></tr>
+                <tr><td>压缩后“忘了”之前的决定</td><td>摘要丢失细节，或切点选错</td><td>把关键约束写进项目上下文/系统提示；必要时用分支回到压缩前。</td></tr>
+                <tr><td><code>agent_end</code> 后还有输出</td><td>重试、压缩重试或排队消息又启动了一次 run</td><td>用 <code>agent_settled</code> 判断真正结束。</td></tr>
+                <tr><td>扩展能读我的凭证</td><td>同进程、同权限</td><td>只安装可信扩展；需要隔离就用容器（见第 11 章）。</td></tr>
+                <tr><td>Windows 上路径/命令异常</td><td>bash 工具与 PowerShell 工具语义不同</td><td>优先用 <code>read</code>/<code>edit</code>/<code>grep</code> 等跨平台工具；明确指定 shell。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h2 id="repo"><span class="h2-num">12.8</span>从源码运行 pi</h2>
+          <p>想改核心时，在仓库里：</p>
+          <div class="code-panel" data-file="README.md" data-lang="bash" data-start="86" data-highlight="1-4,6">
+            <div class="code-head">
+              <span class="path">README.md</span>
+              <span class="right"><span class="lang">bash</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+npm install --ignore-scripts   # 安装依赖，不跑生命周期脚本
+npm run build                  # 刷新模型数据并构建全部包
+npm run build:offline          # 无网络时用现有模型数据重建
+npm run check                  # lint + format + 类型检查
+./test.sh                      # 跑测试（无 API key 时跳过依赖 LLM 的用例）
+./pi-test.sh                   # 直接从源码启动 pi，可在任意目录运行
+            </script>
+            <ul class="code-notes">
+              <li><b>L86</b><span><code>--ignore-scripts</code> 与安装文档一致，避免依赖安装阶段执行任意脚本。</span></li>
+              <li><b>L87-88</b><span><code>build</code> 会先刷新模型目录；离线环境用 <code>build:offline</code>，否则会卡在网络请求。</span></li>
+              <li><b>L90-91</b><span><code>pi-test.sh</code> 用 <code>tsx</code>/源码入口启动，改完代码不必先构建整个仓库；适合调 TUI 与 loop。</span></li>
+            </ul>
+          </div>
+
+          <h2 id="wrap"><span class="h2-num">12.9</span>结语：把 agent 当成分布式系统</h2>
+          <p>回头看，pi 的每一层都在回答同一个问题：<strong>当外部依赖又慢、又贵、又会出错时，如何让系统仍然可理解、可恢复、可扩展？</strong></p>
+          <ul>
+            <li><code>pi-ai</code>：把不可控的 provider 关进适配器；</li>
+            <li><code>agent-core</code>：用明确的事件与 turn 边界描述控制流；</li>
+            <li><code>AgentSession</code>：用组合与钩子把策略和机制分开；</li>
+            <li>会话树：用不可变日志换可审计与可分支；</li>
+            <li>扩展：把定制推到进程边界，而不是塞进核心；</li>
+            <li>TUI：承认终端是流，只改该改的行。</li>
+          </ul>
+          <p>这些选择不完美，但彼此一致。理解它们之后，你不需要记住每个函数——你可以在需要时找到正确的那一层，并且知道改动会波及哪里。</p>
+
+          <div class="checkpoint">
+            <h4>最后检查</h4>
+            <ul>
+              <li>你能在不看源码的情况下画出 prompt → turn → tool → compaction 的事件顺序吗？</li>
+              <li>如果让你给 pi 加一个“审批危险命令”的功能，你会放在扩展、session 还是 loop？为什么？</li>
+              <li>如果上下文总是溢出，你会先改工具结果、压缩策略，还是系统提示？依据是什么？</li>
+              <li>你能解释为什么 <code>agent_end</code> 不等于“任务结束”吗？</li>
+            </ul>
+          </div>
+
+          <div class="callout note">
+            <div class="callout-title">关于这份教程</div>
+            <p>所有代码片段与行号来自 commit <code>531340f</code>（2026-10-27，v1.4.0）。源码会演进，读的时候以你本地 checkout 为准；章节里的“为什么”比行号更耐用。</p>
+          </div>
+
+          <div class="footer-note">
+            <span>全文完 · 回到目录</span>
+            <span>hands-on</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>

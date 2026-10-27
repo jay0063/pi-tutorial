@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · TUI 差分渲染 — pi 源码之旅</title>
+<meta name="description" content="pi-tui 的组件模型、布局树、主屏渲染、行级 diff、16ms 节流、光标与 Kitty 图像。">
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <span class="brand-mark">π</span>
+      <span class="brand-text"><strong>pi 源码之旅</strong><span>agent harness field notes</span></span>
+    </a>
+    <div class="side-search"><input id="nav-search" type="search" placeholder="筛选章节…" aria-label="筛选章节"></div>
+    <nav id="sidebar-nav" aria-label="章节导航"></nav>
+    <div class="side-foot">
+      <div>v1.4.0 · commit 531340f</div>
+      <div>源码快照 2026-10-27</div>
+      <div class="side-actions">
+        <button class="icon-btn" data-theme-toggle type="button">☀ 日间</button>
+        <button class="icon-btn" data-font-toggle type="button">Aa 宽度</button>
+      </div>
+      <div id="kbd-hint" style="margin-top:10px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="read-progress" id="read-progress"><span></span></div>
+    <div class="mobile-bar">
+      <button class="icon-btn" data-nav-toggle type="button" aria-label="打开目录">☰ 目录</button>
+      <span class="mb-title" id="mobile-title">TUI 差分渲染</span>
+      <button class="icon-btn" data-theme-toggle type="button">☀</button>
+    </div>
+
+    <div class="page">
+      <div class="page-inner">
+        <article>
+          <header class="chapter-head">
+            <div class="chapter-mark">Chapter 08 · pi-tui</div>
+            <h1>终端不是画布，<br>是一条会滚动的日志</h1>
+            <p class="lead">在终端里做流式 UI，难点不是“画出来”，而是<strong>只改该改的行</strong>：不闪屏、不破坏滚动历史、不把光标弄丢。pi-tui 自己实现了组件模型、布局树和行级 diff，只依赖 ANSI 转义序列。</p>
+            <div class="meta-row">
+              <span>阅读约 28 分钟</span>
+              <span>关键文件 4 个</span>
+              <span>含交互演示</span>
+            </div>
+          </header>
+
+          <h2 id="why"><span class="h2-num">8.1</span>为什么不直接用 Ink / React</h2>
+          <p>把一个 React 渲染器塞进终端，会得到“每次状态变化重绘整棵树”的模型。对聊天流式输出，这有三个问题：</p>
+          <ul>
+            <li><strong>闪屏</strong>：整屏重写会让终端不断滚动/闪烁，尤其是在慢速 SSH 上。</li>
+            <li><strong>滚动历史被破坏</strong>：用户向上翻看时，重绘会把视口拉回底部。</li>
+            <li><strong>成本高</strong>：每个 token 都触发一次虚拟 DOM diff，CPU 浪费在不变的行上。</li>
+          </ul>
+          <p>pi 的选择是“<strong>组件返回字符串数组，渲染器做行级 diff</strong>”。没有虚拟 DOM，没有 reconciliation；组件自己决定在给定宽度下输出哪些行。</p>
+
+          <h2 id="component"><span class="h2-num">8.2</span>组件契约：一个函数，宽度进、行数组出</h2>
+
+          <div class="code-panel" data-file="packages/tui/src/tui.ts" data-lang="ts" data-start="117" data-highlight="2-7,9-13,20-24">
+            <div class="code-head">
+              <span class="path">packages/tui/src/tui.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+export interface Component {
+	/**
+	 * Render the component to lines for the given viewport width
+	 * @param width - Current viewport width
+	 * @returns Array of strings, each representing a line
+	 */
+	render(width: number): string[];
+
+	/** Optional handler for keyboard input when component has focus. */
+	handleInput?(data: string): void;
+
+	/** Optional normalized mouse handler. */
+	handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined;
+
+	/**
+	 * If true, component receives key release events (Kitty protocol).
+	 * Default is false - release events are filtered out.
+	 */
+	wantsKeyRelease?: boolean;
+
+	/**
+	 * Invalidate any cached rendering state.
+	 * Called when theme changes or when component needs to re-render from scratch.
+	 */
+	invalidate(): void;
+}
+            </script>
+            <ul class="code-notes">
+              <li><b>L123</b><span><strong>宽度是唯一布局输入</strong>。组件不能假设终端大小，也不能读全局状态；这使它可测试、可嵌套、可缓存。</span></li>
+              <li><b>L124</b><span>返回的是“屏幕行”，不是逻辑段落。自动换行、截断、边框都由组件自己处理。</span></li>
+              <li><b>L127</b><span>输入处理是可选的；焦点由容器管理。组件不需要知道事件循环。</span></li>
+              <li><b>L141</b><span><code>invalidate()</code> 清缓存。主题切换、字体宽度变化时必须调用，否则会复用旧颜色/旧宽度。</span></li>
+            </ul>
+          </div>
+
+          <p>组件之上是布局节点。pi 不要求组件继承某个基类，而是用 <code>Symbol.for("@earendil-works/pi-tui/layout-node")</code> 做能力探测：实现了这个方法的组件参与布局，否则按固定行数处理。这避免了深继承，也允许第三方组件只实现 <code>render</code>。</p>
+
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>布局节点</th><th>行为</th><th>用途</th></tr></thead>
+              <tbody>
+                <tr><td><code>vstack</code></td><td>垂直堆叠；每项有 basis/grow/shrink/min/max</td><td>主对话流 + 输入框 + 状态栏。</td></tr>
+                <tr><td><code>hstack</code></td><td>水平排列；支持对齐与间距</td><td>侧栏、状态行、并排 diff。</td></tr>
+                <tr><td><code>scroll</code></td><td>视口裁剪、滚动状态、内容宽度</td><td>长对话、帮助面板、日志。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>布局计算带<strong>按组件与宽度缓存</strong>：同一组件在同一宽度下只渲染一次。这对流式场景很关键——每帧只有少数组件的内容变了，其余直接复用行数组。</p>
+
+          <h2 id="screen"><span class="h2-num">8.3</span>主屏 vs 备用屏</h2>
+          <p>pi 有两种 TUI 实现：</p>
+          <ul>
+            <li><strong>主屏</strong>（<code>TuiMainScreen</code>）：内容写入终端正常缓冲区，保留 scrollback。用户可以用终端自身的滚动条/快捷键翻历史。适合“对话式”长输出。</li>
+            <li><strong>备用屏</strong>（<code>TuiAltScreen</code>）：切换到全屏备用缓冲区，退出时恢复。适合全屏编辑器/仪表盘。</li>
+          </ul>
+          <p>主屏的难点在于<strong>视口会随内容增长而滚动</strong>。渲染器必须知道“上一次视口顶部”和“硬件光标所在行”，否则 diff 的坐标会错位。这就是 <code>previousViewportTop</code>、<code>hardwareCursorRow</code> 这些字段存在的原因。</p>
+
+          <h2 id="diff"><span class="h2-num">8.4</span>行级 diff：找到变化区间</h2>
+          <p><code>doRender()</code> 的第一步是把整棵组件树渲染成新行数组；然后与上一帧逐行比较，找到<strong>第一个和最后一个变化的行</strong>。中间没变的部分不重写。</p>
+
+          <div class="code-panel" data-file="packages/tui/src/tui-main-screen.ts" data-lang="ts" data-start="363" data-highlight="2-12,14-18,20-23">
+            <div class="code-head">
+              <span class="path">packages/tui/src/tui-main-screen.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+		// Find first and last changed lines
+		let firstChanged = -1;
+		let lastChanged = -1;
+		const maxLines = Math.max(newLines.length, this.previousLines.length);
+		for (let i = 0; i < maxLines; i++) {
+			const oldLine = i < this.previousLines.length ? this.previousLines[i] : "";
+			const newLine = i < newLines.length ? newLines[i] : "";
+
+			if (oldLine !== newLine) {
+				if (firstChanged === -1) {
+					firstChanged = i;
+				}
+				lastChanged = i;
+			}
+		}
+		const appendedLines = newLines.length > this.previousLines.length;
+		if (appendedLines) {
+			if (firstChanged === -1) {
+				firstChanged = this.previousLines.length;
+			}
+			lastChanged = newLines.length - 1;
+		}
+		if (firstChanged !== -1) {
+			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
+			firstChanged = expandedRange.firstChanged;
+			lastChanged = expandedRange.lastChanged;
+		}
+		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
+            </script>
+            <ul class="code-notes">
+              <li><b>L364-365</b><span>只记录区间边界，不保存每行 diff。对终端来说，重写区间内的少量未变行通常比精确 patch 更便宜。</span></li>
+              <li><b>L367</b><span>取两边长度的最大值；新增行与旧的空串比较，删除行与新的空串比较。</span></li>
+              <li><b>L376-380</b><span>如果只是追加（常见于流式输出），把区间强制扩到末尾。这允许“追加优化”：不用重写旧行，直接在末尾输出。</span></li>
+              <li><b>L385</b><span>Kitty 图像占多行且用占位符表示，必须把整个图像块纳入变化区间，否则会留下残影。</span></li>
+            </ul>
+          </div>
+
+          <h3>什么时候放弃 diff，整屏重绘</h3>
+          <p>以下情况会触发 <code>fullRender(true)</code>：</p>
+          <ul>
+            <li>宽度或高度变化（<code>resize</code>）；</li>
+            <li>第一个变化行在<strong>上一次视口顶部之上</strong>——那里已经滚出屏幕，无法原地修改；</li>
+            <li>删除的行数超过一屏；</li>
+            <li>内容缩短且启用了 <code>clearOnShrink</code>，且没有浮层；</li>
+            <li>浮层/模态框改变了合成结果。</li>
+          </ul>
+          <p>整屏重绘被包裹在 <code>\x1b[?2026h</code> … <code>\x1b[?2026l</code>（synchronized output）之间。支持这个私有模式的终端会把整帧原子呈现，避免撕裂。不支持的终端会忽略序列，退化为普通写。</p>
+
+          <div class="callout note">
+            <div class="callout-title">为什么是“从第一个变化行重写到末尾”</div>
+            <p>终端不能随机访问任意行：要改第 3 行，必须先移动光标；要改第 3 行之后的内容，重写尾部通常比逐行跳跃更可靠，也能自然处理行数变化。区间 diff 的真正收益是<strong>保留上方的 scrollback 与视口位置</strong>，而不是节省几个字节。</p>
+          </div>
+
+          <h2 id="throttle"><span class="h2-num">8.5</span>16ms 节流与输入优先</h2>
+          <p>模型每个 token 都会触发一次状态更新。如果每次都渲染，CPU 会被吃满。pi 把普通渲染限制在最多约 60fps：</p>
+
+          <div class="code-panel" data-file="packages/tui/src/tui.ts" data-lang="ts" data-start="1027" data-highlight="7-9,21-27">
+            <div class="code-head">
+              <span class="path">packages/tui/src/tui.ts</span>
+              <span class="right"><span class="lang">ts</span><button class="copy-btn" type="button">复制</button></span>
+            </div>
+            <script type="text/plain" class="src">
+	requestRender(force = false): void {
+		if (force) {
+			this.resetRenderState();
+			this.requestImmediateRender();
+			return;
+		}
+		if (this.renderRequested) return;
+		this.renderRequested = true;
+		process.nextTick(() => this.scheduleRender());
+	}
+
+	private requestImmediateRender(): void {
+		this.cancelRenderTimer();
+		this.renderRequested = true;
+		if (this.immediateRenderScheduled) return;
+		this.immediateRenderScheduled = true;
+		process.nextTick(() => {
+			this.immediateRenderScheduled = false;
+			if (this.stopped || !this.renderRequested) return;
+			// A previously queued scheduleRender() can create a timer before this
+			// callback runs. User input must preempt that throttled frame.
+			this.cancelRenderTimer();
+			this.renderRequested = false;
+			this.lastRenderAt = performance.now();
+			this.doRender();
+		});
+	}
+            </script>
+            <ul class="code-notes">
+              <li><b>L1027</b><span><code>requestRender()</code> 是幂等的：一帧内多次请求只安排一次。注意它不立即渲染，而是先 <code>nextTick</code>，让同一轮事件循环里的多次更新合并。</span></li>
+              <li><b>L1029</b><span><code>force</code> 会清空渲染状态并走立即渲染，用于 resize、主题切换等不能等一帧的场景。</span></li>
+              <li><b>L1043</b><span><strong>输入优先</strong>：键盘输入不能等 16ms 的节流计时器（Windows 上 <code>setTimeout(0)</code> 可能就是一整帧），所以另走一条立即渲染路径，并取消已排队的节流帧。</span></li>
+              <li><b>L1046</b><span>注释记录了一个真实竞态：先排队的 <code>scheduleRender</code> 可能已经创建 timer，必须显式取消。</span></li>
+            </ul>
+          </div>
+
+          <p><code>scheduleRender()</code> 用 <code>lastRenderAt</code> 计算剩余时间：<code>delay = max(0, 16 - elapsed)</code>。渲染后如果又有请求，会再排一帧，保证最终状态不会丢。</p>
+
+          <h2 id="cursor"><span class="h2-num">8.6</span>光标、浮层与图片</h2>
+          <ul>
+            <li><strong>假光标</strong>：组件可以在行内放一个标记，渲染器在合成后解析成真实光标位置；这样嵌套组件不需要知道终端坐标。</li>
+            <li><strong>硬件光标</strong>：<code>showHardwareCursor</code> 控制是否显示。输入框需要真实光标，流式输出时通常隐藏以减少闪烁。</li>
+            <li><strong>浮层</strong>：模态框/补全菜单在行数组合成阶段叠加，而不是插入组件树。这样它们不会影响底层布局，关闭时也不需要重排。</li>
+            <li><strong>Kitty 图像</strong>：图片以占位符行表示，渲染器记录图像 id 与占用行数；变化时删除旧图、重绘新图。删除区间必须覆盖整个图像块。</li>
+            <li><strong>宽字符</strong>：<code>visibleWidth()</code> 按 grapheme cluster 计算终端列宽，而不是 <code>string.length</code>；中日韩字符、emoji、组合符号都按实际宽度处理。</li>
+          </ul>
+
+          <h2 id="demo"><span class="h2-num">8.7</span>看一帧如何变化</h2>
+          <p>下面的演示把每一帧标出了“实际重写的行”。真实渲染器会从第一个变化行重写到末尾，但只有变化的行在视觉上不同。</p>
+
+          <div class="demo" data-demo="tui">
+            <div class="demo-head">
+              <span class="title">pi-tui · frame diff</span>
+              <span class="pill teal">main screen</span>
+            </div>
+            <div class="demo-body">
+              <div class="tui-frame-label" style="font-family:var(--mono);font-size:9.5px;color:var(--muted);margin-bottom:8px"></div>
+              <div class="tui-screen"></div>
+              <div class="demo-controls">
+                <button class="btn btn-sm" data-tui-next type="button">下一帧 →</button>
+                <button class="btn btn-sm" data-tui-reset type="button">重置</button>
+                <span class="demo-note" style="margin:0">第 4 帧是“追加”：新行在末尾，上方内容完全不动。</span>
+              </div>
+            </div>
+          </div>
+
+          <h2 id="critique"><span class="h2-num">8.8</span>设计评价</h2>
+          <p>pi-tui 是一个“足够小、足够可控”的终端 UI 层。它没有追求通用 GUI 框架的能力，而是围绕三个约束设计：</p>
+          <ol>
+            <li><strong>终端是流</strong>：只追加、少重写、保护 scrollback。</li>
+            <li><strong>输入必须跟手</strong>：渲染可以节流，键盘不能。</li>
+            <li><strong>组件是无状态渲染函数</strong>：给定宽度就能算出完整行数组，便于缓存与测试。</li>
+          </ol>
+          <p>代价是：复杂布局（例如自适应表格、嵌套滚动）需要手工计算；组件作者必须理解 ANSI、宽字符与裁剪。它不适合做富交互界面，但对 coding agent 这种“长日志 + 一个输入框 + 偶尔浮层”的形态，恰好合适。</p>
+
+          <div class="checkpoint">
+            <h4>读完本章，你应该能回答</h4>
+            <ul>
+              <li>为什么组件接口把 <code>width</code> 作为唯一布局参数？</li>
+              <li>什么情况下渲染器必须放弃行级 diff，整屏重绘？</li>
+              <li>16ms 节流如何避免“最后一帧丢失”？输入为什么能绕过它？</li>
+              <li>Kitty 图像为什么要扩展变化区间？</li>
+            </ul>
+          </div>
+
+          <div class="footer-note">
+            <span>下一章：TypeScript 精要</span>
+            <span>1 live demo</span>
+          </div>
+          <nav class="footer-nav" id="footer-nav"></nav>
+        </article>
+      </div>
+      <aside class="toc"><div class="toc-inner" id="toc-nav"></div></aside>
+    </div>
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+</body>
+</html>
